@@ -290,7 +290,6 @@ class Deconvolution(HWCustomOp):
         return total_cycles
     # Jude: Done
 
-
     def bram_estimation(self):
         return 0
 

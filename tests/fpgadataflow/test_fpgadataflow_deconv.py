@@ -110,7 +110,7 @@ def set_up_reference_model(idt, wdt, odt, k, idim, ifm_ch, ofm_ch, stride, paddi
 
     # initialize model
     model.set_tensor_datatype("inp", idt)
-    model.set_tensor_datatype(model.graph.output[0].name, odt)
+    model.set_tensor_datatype(model.get_first_global_out(), odt)
     model.set_tensor_datatype("W", wdt)
 
     w_tensor = gen_finn_dt_tensor(wdt, [ifm_ch, ofm_ch, k, k])
@@ -393,7 +393,6 @@ def test_fpgadataflow_deconv_revd2(idim, stride, ifm_ch, ofm_ch, simd, pe, k, pa
         print("cycles_estimate: {}".format(cycles_estimate))
     # Jude: Done
 
-
     if exec_mode == "rtlsim":
         node = model.get_nodes_by_op_type("Deconvolution_hls")[0]
         inst = getCustomOp(node)
@@ -402,12 +401,10 @@ def test_fpgadataflow_deconv_revd2(idim, stride, ifm_ch, ofm_ch, simd, pe, k, pa
         exp_cycles = exp_cycles_dict[node.name]
         # Jude: Edited
         print("Expected cycles: {}, RTL sim cycles: {}".format(exp_cycles, cycles_rtlsim))
-        # Jude: Done
         assert np.isclose(exp_cycles, cycles_rtlsim, atol=10)
         assert exp_cycles != 0
 
 
-# Jude: Edited
 # Regression test for the in0_V port width. Without
 # `#pragma HLS aggregate variable=in0_V compact=bit`, HLS gives each sub-byte hls::vector
 # element its own byte, so UINT4 x SIMD=4 synthesizes a 32-bit port while
