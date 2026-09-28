@@ -10,6 +10,16 @@
 # this file unsets its scratch variables at the end.
 _FINN_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# These normally come from ~/.bashrc, which a non-interactive shell (cron, ssh, an agent)
+# never sources -- it returns early unless interactive. Without them run-docker.sh only
+# warns and the build fails much later at HLS; and an unset FINN_DOCKER_EXTRA trips a
+# caller's `set -u` below. Defaults only: anything already exported wins.
+: "${FINN_XILINX_PATH:=/mnt/Crucial/Xilinx2024/}"
+: "${FINN_XILINX_VERSION:=2024.1}"
+: "${NUM_DEFAULT_WORKERS:=16}"
+: "${FINN_DOCKER_EXTRA:=}"
+export FINN_XILINX_PATH FINN_XILINX_VERSION NUM_DEFAULT_WORKERS FINN_DOCKER_EXTRA
+
 FINN_LICENSE_MOUNT=" -v $HOME/.Xilinx/:$HOME/.Xilinx/ -e XILINXD_LICENSE_FILE=$HOME/.Xilinx/ "
 
 case " $FINN_DOCKER_EXTRA " in
