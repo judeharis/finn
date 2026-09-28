@@ -135,6 +135,11 @@ elif [ "$1" = "build_custom" ]; then
   #FINN_HOST_BUILD_DIR=$BUILD_DATAFLOW_DIR/build
   gecho "Running build_custom: $BUILD_CUSTOM_DIR/$FLOW_NAME.py"
   DOCKER_CMD="python -mpdb -cc -cq $FLOW_NAME.py ${@:4}"
+# Jude: Edited
+elif [ "$1" = "run_test" ]; then
+  gecho "Running test suite"
+  DOCKER_CMD="python -mpdb -cc -cq -m deconv_test"
+# Jude: Done
 elif [ -z "$1" ]; then
    gecho "Running container only"
    DOCKER_CMD="bash"

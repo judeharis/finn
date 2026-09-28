@@ -1,0 +1,149 @@
+[
+  {
+    "name": "baseline",
+    "K": 4,
+    "S": 2,
+    "P": 1,
+    "H": 8,
+    "W": 8,
+    "CI": 2,
+    "CO": 3,
+    "PE": 1,
+    "SIMD": 1,
+    "cycles_rtlsim": 7350,
+    "exp_cycles": 7320,
+    "odim": [
+      16,
+      16
+    ],
+    "shape_ok": true,
+    "values_ok": true,
+    "ok": true
+  },
+  {
+    "name": "vary_P",
+    "K": 4,
+    "S": 2,
+    "P": 2,
+    "H": 8,
+    "W": 8,
+    "CI": 2,
+    "CO": 3,
+    "PE": 1,
+    "SIMD": 1,
+    "cycles_rtlsim": 4733,
+    "exp_cycles": 4704,
+    "odim": [
+      14,
+      14
+    ],
+    "shape_ok": true,
+    "values_ok": true,
+    "ok": true
+  },
+  {
+    "name": "vary_H",
+    "K": 4,
+    "S": 2,
+    "P": 1,
+    "H": 4,
+    "W": 4,
+    "CI": 2,
+    "CO": 3,
+    "PE": 1,
+    "SIMD": 1,
+    "cycles_rtlsim": 2158,
+    "exp_cycles": 2136,
+    "odim": [
+      8,
+      8
+    ],
+    "shape_ok": true,
+    "values_ok": true,
+    "ok": true
+  },
+  {
+    "name": "H_neq_W",
+    "K": 4,
+    "S": 2,
+    "P": 1,
+    "H": 4,
+    "W": 8,
+    "CI": 2,
+    "CO": 3,
+    "PE": 1,
+    "SIMD": 1,
+    "cycles_rtlsim": 3894,
+    "exp_cycles": 3864,
+    "odim": [
+      8,
+      16
+    ],
+    "shape_ok": true,
+    "values_ok": true,
+    "ok": true
+  },
+  {
+    "name": "vary_K_big",
+    "K": 6,
+    "S": 2,
+    "P": 2,
+    "H": 8,
+    "W": 8,
+    "CI": 2,
+    "CO": 3,
+    "PE": 1,
+    "SIMD": 1,
+    "cycles_rtlsim": 13866,
+    "exp_cycles": 13824,
+    "odim": [
+      16,
+      16
+    ],
+    "shape_ok": true,
+    "values_ok": true,
+    "ok": true
+  },
+  {
+    "name": "vary_K_small",
+    "K": 6,
+    "S": 2,
+    "P": 2,
+    "H": 4,
+    "W": 4,
+    "CI": 2,
+    "CO": 3,
+    "PE": 1,
+    "SIMD": 1,
+    "cycles_rtlsim": 3482,
+    "exp_cycles": 3456,
+    "odim": [
+      8,
+      8
+    ],
+    "shape_ok": true,
+    "values_ok": true,
+    "ok": true
+  },
+  {
+    "name": "folded",
+    "K": 4,
+    "S": 2,
+    "P": 1,
+    "H": 8,
+    "W": 8,
+    "CI": 4,
+    "CO": 4,
+    "PE": 2,
+    "SIMD": 2,
+    "cycles_rtlsim": 4911,
+    "exp_cycles": 4880,
+    "odim": [
+      16,
+      16
+    ],
+    "shape_ok": true,
+    "values_ok": true,
+    "ok": true
+  }
+]

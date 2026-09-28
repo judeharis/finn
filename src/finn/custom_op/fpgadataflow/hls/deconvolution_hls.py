@@ -181,6 +181,15 @@ class Deconvolution_hls(Deconvolution, HLSBackend):
         self.code_gen_dict["$PRAGMAS$"] = ["#pragma HLS INTERFACE axis port=in0_V"]
         self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS INTERFACE axis port=out0_V")
         self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS INTERFACE ap_ctrl_none port=return")
+        # Jude: Edited
+        self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS dataflow disable_start_propagation")
+        # Without compact=bit, HLS gives every sub-byte hls::vector element its own
+        # byte, so UINT4 x SIMD=4 synthesizes a 32-bit port while get_instream_width()
+        # (and hence the stitched stream and the driver) says 16. The kernel then reads
+        # [x0, x2, 0, 0]. Same pragma as the other hls_vector ops (concat/pool/split).
+        self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS aggregate variable=in0_V compact=bit")
+        self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS aggregate variable=out0_V compact=bit")
+        # Jude: Done
 
         self.code_gen_dict["$PRAGMAS$"].append('#include "params.h"')
         # the weight tensor is ap_uint<simd*prec> [PE][WMEM]

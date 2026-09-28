@@ -296,10 +296,34 @@ def test_fpgadataflow_deconv_pixel_pad(
 # padding
 @pytest.mark.parametrize("padding", [1])
 # exec mode
-@pytest.mark.parametrize("exec_mode", ["cppsim"])
+# Jude: Edited
+@pytest.mark.parametrize("exec_mode", ["rtlsim"])
 @pytest.mark.fpgadataflow
 @pytest.mark.slow
 @pytest.mark.vivado
+
+# # input image dimension
+# @pytest.mark.parametrize("idim", [[128, 128]])
+# # number of rows and number of cols to add
+# @pytest.mark.parametrize("stride", [[2, 2]])
+# # number of channels
+# @pytest.mark.parametrize("ifm_ch", [32])
+# # number of channels
+# @pytest.mark.parametrize("ofm_ch", [3])
+# # Input parallelism
+# @pytest.mark.parametrize("simd", [1])
+# # PE
+# @pytest.mark.parametrize("pe", [1])
+# # kernel size
+# @pytest.mark.parametrize("k", [6])
+# # padding
+# @pytest.mark.parametrize("padding", [2])
+# # exec mode
+# @pytest.mark.parametrize("exec_mode", ["cppsim"])
+# @pytest.mark.fpgadataflow
+# @pytest.mark.slow
+# @pytest.mark.vivado
+# Jude: Done
 def test_fpgadataflow_deconv_revd2(idim, stride, ifm_ch, ofm_ch, simd, pe, k, padding, exec_mode):
     idt = wdt = DataType["INT8"]
     wdt = idt
@@ -358,6 +382,17 @@ def test_fpgadataflow_deconv_revd2(idim, stride, ifm_ch, ofm_ch, simd, pe, k, pa
     assert y_produced.shape == expected_oshape
     y_produced = y_produced.transpose(0, 3, 1, 2)
     assert (y_produced == y_expected).all()
+    # Jude: Edited
+    print("Test passed for Deconvolution_hls with idim {}, stride {}, ifm_ch {}, ofm_ch {}, simd {}, pe {}, k {}, padding {}, exec_mode {}".format(
+        idim, stride, ifm_ch, ofm_ch, simd, pe, k, padding, exec_mode
+    ))
+    if exec_mode == "cppsim":
+        node = model.get_nodes_by_op_type("Deconvolution_hls")[0]
+        inst = getCustomOp(node)
+        cycles_estimate = inst.get_nodeattr("cycles_estimate")
+        print("cycles_estimate: {}".format(cycles_estimate))
+    # Jude: Done
+
 
     if exec_mode == "rtlsim":
         node = model.get_nodes_by_op_type("Deconvolution_hls")[0]
@@ -365,5 +400,72 @@ def test_fpgadataflow_deconv_revd2(idim, stride, ifm_ch, ofm_ch, simd, pe, k, pa
         cycles_rtlsim = inst.get_nodeattr("cycles_rtlsim")
         exp_cycles_dict = model.analysis(exp_cycles_per_layer)
         exp_cycles = exp_cycles_dict[node.name]
+        # Jude: Edited
+        print("Expected cycles: {}, RTL sim cycles: {}".format(exp_cycles, cycles_rtlsim))
+        # Jude: Done
         assert np.isclose(exp_cycles, cycles_rtlsim, atol=10)
         assert exp_cycles != 0
+
+
+# Jude: Edited
+# Regression test for the in0_V port width. Without
+# `#pragma HLS aggregate variable=in0_V compact=bit`, HLS gives each sub-byte hls::vector
+# element its own byte, so UINT4 x SIMD=4 synthesizes a 32-bit port while
+# get_instream_width() (and so the stream and the driver) packs 16 bits; the kernel then
+# reads [x0, x2, 0, 0]. It only shows with a sub-byte input, SIMD >= 2 and rtlsim: at INT8
+# or SIMD=1 the two widths agree, and cppsim never synthesizes the port. Output-only on
+# purpose -- the cycle check lives in test_fpgadataflow_deconv_revd2.
+# input datatype, input parallelism, PE
+@pytest.mark.parametrize(
+    "idt_name,simd,pe",
+    [
+        ("UINT4", 2, 1),
+        ("UINT4", 4, 3),
+        ("INT4", 4, 3),
+        # control: byte-aligned, so the widths agree even without the pragma
+        ("INT8", 4, 3),
+    ],
+)
+@pytest.mark.fpgadataflow
+@pytest.mark.slow
+@pytest.mark.vivado
+def test_fpgadataflow_deconv_subbyte_input(idt_name, simd, pe):
+    idt = DataType[idt_name]
+    wdt = DataType["INT8"]
+    odt = DataType["INT32"]
+    idim = [8, 8]
+    stride = [2, 2]
+    ifm_ch = 4
+    ofm_ch = 3
+    k = 4
+    padding = 1
+    idim_h, idim_w = idim
+    stride_h, stride_w = stride
+
+    ref_model, w_tensor = set_up_reference_model(
+        idt, wdt, odt, k, idim, ifm_ch, ofm_ch, stride, padding
+    )
+    model = create_deconv_node(idt, wdt, odt, k, idim, ifm_ch, ofm_ch, stride, padding, w_tensor)
+
+    odim_h = (idim_h - 1) * stride_h - 2 * padding + (k - 1) + 1
+    odim_w = (idim_w - 1) * stride_w - 2 * padding + (k - 1) + 1
+
+    input_tensor = gen_finn_dt_tensor(idt, [1, ifm_ch, idim_h, idim_w])
+    y_expected = oxe.execute_onnx(ref_model, {"inp": input_tensor})["outp"]
+
+    deconv_node = getCustomOp(model.get_nodes_by_op_type("Deconvolution_hls")[0])
+    deconv_node.set_nodeattr("PE", pe)
+    deconv_node.set_nodeattr("SIMD", simd)
+
+    model = model.transform(GiveUniqueNodeNames())
+    model = model.transform(PrepareIP(test_fpga_part, target_clk_ns))
+    model = model.transform(HLSSynthIP())
+    model = model.transform(PrepareRTLSim())
+    model = model.transform(SetExecMode("rtlsim"))
+
+    input_tensor_nhwc = input_tensor.transpose(0, 2, 3, 1)
+    y_produced = oxe.execute_onnx(model, {"inp": input_tensor_nhwc})["outp"]
+    assert y_produced.shape == (1, odim_h, odim_w, ofm_ch)
+    y_produced = y_produced.transpose(0, 3, 1, 2)
+    assert (y_produced == y_expected).all()
+# Jude: Done

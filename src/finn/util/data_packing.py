@@ -33,9 +33,24 @@ import os
 import sys
 from bitstring import BitArray
 from qonnx.core.datatype import DataType
-from qonnx.core.modelwrapper import ModelWrapper
-from qonnx.custom_op.registry import getCustomOp
+# Jude: Edited, Removed
 from qonnx.util.basic import gen_finn_dt_tensor, roundup_to_integer_multiple
+
+# MakePYNQDriver copies this module onto the board but ships only a minimal qonnx
+# subset (qonnx/core/datatype.py + qonnx/util/basic.py). ModelWrapper and
+# getCustomOp are used solely by get_driver_shapes(), which is build-time only --
+# the deployed driver has its io_shape_dict baked in and never calls it. Keeping
+# these imports at module level made every generated driver die on import with
+# "ModuleNotFoundError: No module named 'qonnx.core.modelwrapper'".
+# The names must still exist because get_driver_shapes' annotations are evaluated
+# at def time.
+try:
+    from qonnx.core.modelwrapper import ModelWrapper
+    from qonnx.custom_op.registry import getCustomOp
+except ImportError:  # deployed driver: build-time helpers are unavailable
+    ModelWrapper = None
+    getCustomOp = None
+# Jude: Done
 from typing import Dict
 
 

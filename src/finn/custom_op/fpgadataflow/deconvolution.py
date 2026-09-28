@@ -157,8 +157,139 @@ class Deconvolution(HWCustomOp):
         out_width = o_bits * self.get_nodeattr("PE")
         return out_width
 
-    def get_exp_cycles(self):
-        return 0
+    # Jude: Edited
+    def get_exp_cycles(self) -> int:
+        # Regression coefficients for overhead = c0 + c1*H_EFF + c2*SF + c3*K
+        # + c4*K*H_EFF + c5*K*SF, fit against 32 real cosim runs. See
+        # deconv_cycle_estimator.py's module docstring/--validate for provenance.
+        # NOTE: every one of those 32 runs has S=1, and CROP is identically 0
+        # whenever S==1 (see the CROP derivation below), so the fit says nothing
+        # about either strided deconv or the cropped-tail effect.
+        _OVERHEAD_COEFFS = dict(
+            const=-1130.25,
+            H_EFF=-182.25,
+            SF=-16.25,
+            K=461.40,
+            K_H_EFF=98.05,
+            K_SF=8.00,
+        )
+        _CALIBRATED_K = (3, 5)
+        _CALIBRATED_S = (1,)
+        _CALIBRATED_P = (1, 2)
+        _CALIBRATED_H = (4, 8)
+        _CALIBRATED_CI = (3,)
+        _CALIBRATED_CO = (3,)
+        kh, kw = self.get_nodeattr("KernelDim")
+        sh, sw = self.get_nodeattr("Stride")
+        ph, pw = self.get_nodeattr("Padding")
+        if kh != kw:
+            raise ValueError(f"deconv HLS kernel requires a square KernelDim, got {[kh, kw]}")
+        if sh != sw:
+            raise ValueError(f"deconv HLS kernel requires a square Stride, got {[sh, sw]}")
+        if ph != pw:
+            raise ValueError(f"deconv HLS kernel requires a square Padding, got {[ph, pw]}")
+
+        K, S, P = kh, sh, ph
+        H, W = self.get_nodeattr("IFMDim")
+        CO = self.get_nodeattr("OFMChannels")
+        CI = self.get_nodeattr("IFMChannels")
+        PE = self.get_nodeattr("PE")
+        SIMD = self.get_nodeattr("SIMD")
+
+        if K % S != 0:
+            raise ValueError("Stride must divide kernel size (K % S == 0).")
+        if CO % PE != 0:
+            raise ValueError("PE parallelism must divide output channel count (CO % PE == 0).")
+        if CI % SIMD != 0:
+            raise ValueError("SIMD parallelism must divide input channel count (CI % SIMD == 0).")
+
+        KK = K // S
+        CF = CO // PE
+        SF = CI // SIMD
+
+        # Transliteration of the constexpr block in deconv.hpp:453-459.
+        PADUP = 0 if P >= K - S else (K - P - 1) // S
+        CROP = S * PADUP - ((K - S) - P)
+        H_EFF = PADUP + H + PADUP
+        W_EFF = PADUP + W + PADUP
+        HO_EFF = (H_EFF + 1) * S - K
+        WO_EFF = (W_EFF + 1) * S - K
+
+        N = KK * KK * SF
+
+        # deconv_mvu emits HO_EFF*WO_EFF*CF elements in raster (h, w, cf) order,
+        # but crop<CROP, HO_EFF, WO_EFF, CO> (deconv.hpp:33-61) only forwards
+        # those with CROP <= h < HO_EFF-CROP and CROP <= w < WO_EFF-CROP. The
+        # tail it produces after the last surviving element is never observed:
+        # FINN's rtlsim stops counting once the final output word is received.
+        # So the compute-bound term is set by the *last surviving* element, not
+        # by the full pre-crop count. When CROP == 0 (always true for S == 1)
+        # this reduces exactly to HO_EFF*WO_EFF*CF*N, leaving the S=1
+        # calibration untouched.
+        h_last = HO_EFF - 1 - CROP
+        w_last = WO_EFF - 1 - CROP
+        if h_last < CROP or w_last < CROP:
+            raise ValueError(
+                f"crop<{CROP},{HO_EFF},{WO_EFF},{CO}> leaves an empty output feature map"
+            )
+        output_count = (h_last * WO_EFF + w_last) * CF + CF
+        M = output_count * N
+
+        problems = []
+        if K not in _CALIBRATED_K:
+            problems.append(f"K={K} outside calibrated set {_CALIBRATED_K}")
+        if S not in _CALIBRATED_S:
+            problems.append(f"S={S} not covered by calibration (only S=1 was measured)")
+        if P not in _CALIBRATED_P:
+            problems.append(f"P={P} outside calibrated set {_CALIBRATED_P}")
+        if not (min(_CALIBRATED_H) <= H <= max(_CALIBRATED_H)) or not (
+            min(_CALIBRATED_H) <= W <= max(_CALIBRATED_H)
+        ):
+            problems.append(f"H/W={H}/{W} outside calibrated range {_CALIBRATED_H}")
+        if CI not in _CALIBRATED_CI or CO not in _CALIBRATED_CO:
+            problems.append(
+                f"CI={CI}/CO={CO} were never varied during calibration (always CI=CO=3)"
+            )
+
+        # The fitted overhead models deconv_swg's window-buffer fill/stall
+        # behaviour, and was only ever observed in the S==1 regime, where it is
+        # a large positive correction (up to ~2.2x M). Extrapolating it to
+        # strided deconv is not merely inaccurate but wrong in sign: the one
+        # S=2 measurement available (K=4,S=2,P=1,H=W=8,CI=2,CO=3,PE=SIMD=1,
+        # FINN rtlsim = 7350) sits 30 cycles ABOVE M, i.e. the real correction
+        # there is the dataflow drain latency, not thousands of stall cycles.
+        # So apply the fit only inside the stride it was calibrated for.
+        if S in _CALIBRATED_S:
+            c = _OVERHEAD_COEFFS
+            overhead = (
+                c["const"]
+                + c["H_EFF"] * H_EFF
+                + c["SF"] * SF
+                + c["K"] * K
+                + c["K_H_EFF"] * K * H_EFF
+                + c["K_SF"] * K * SF
+            )
+        else:
+            overhead = 0.0
+            problems.append(
+                f"S={S}: swg stall overhead not modelled (fit is S=1-only); "
+                f"returning the compute-bound term alone, which will slightly under-predict"
+            )
+
+        total_cycles = round(M + overhead)
+
+        if problems:
+            node_name = getattr(
+                getattr(self, "onnx_node", None), "name", self.__class__.__name__
+            )
+            warnings.warn(
+                f"{node_name}: get_exp_cycles() is extrapolating beyond its calibration data: "
+                + "; ".join(problems)
+            )
+
+        return total_cycles
+    # Jude: Done
+
 
     def bram_estimation(self):
         return 0
