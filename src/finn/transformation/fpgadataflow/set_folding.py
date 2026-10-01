@@ -177,6 +177,28 @@ class SetFolding(Transformation):
                         break
                 # increase PE until target met or reached max_pe
                 self.optimize_attribute_val(node_inst, max_pe, "PE")
+            # Jude: Edited
+            elif op_type == "Deconvolution_hls":
+                # Same scheme as MVAU: SIMD (input channels) first, while the weight word
+                # per PE stays <= mvau_wwidth_max, then PE (output channels). Without
+                # this branch the deconv stays at PE1/SIMD1, and two_pass_relaxation
+                # then folds every other layer down to that pace.
+                # get_exp_cycles warns on every call outside its calibration set.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    max_simd = node_inst.get_nodeattr("IFMChannels")
+                    max_pe = node_inst.get_nodeattr("OFMChannels")
+                    wbits = node_inst.get_weight_datatype().bitwidth()
+                    node_inst.set_nodeattr("PE", 1)
+                    node_inst.set_nodeattr("SIMD", 1)
+                    for simd_val in divisors(max_simd):
+                        if wbits * simd_val > self.mvau_wwidth_max:
+                            break
+                        node_inst.set_nodeattr("SIMD", simd_val)
+                        if node_inst.get_exp_cycles() < self.target_cycles_per_frame:
+                            break
+                    self.optimize_attribute_val(node_inst, max_pe, "PE")
+            # Jude: Done
             elif op_type in pe_ops:
                 # Note: Keep original behavior for all custom-ops defining the
                 # NumChannels attribute as it is

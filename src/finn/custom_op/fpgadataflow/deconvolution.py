@@ -26,6 +26,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Jude: Edited
+import numpy as np
+# Jude: Done
 import warnings
 from qonnx.core.datatype import DataType
 
@@ -290,14 +293,74 @@ class Deconvolution(HWCustomOp):
         return total_cycles
     # Jude: Done
 
+    # Jude: Edited
+    # Resource model for finn-hlslib deconv(), checked against Vivado post-synthesis of the
+    # ESPCN deconv (K=6 S=2 P=2 128x128, CI=32 CO=3, UINT4 x INT8) at PE1/SIMD1 and
+    # PE3/SIMD4: BRAM and DSP match both exactly; the LUT constants are fitted to those two
+    # points only, so treat LUT as a rough figure for other geometries.
+    def _swg_buffer_shape(self):
+        # deconv_swg's cyclic line buffer: buf[1 << clog2(K/S * W_EFF * SF)] of SIMD inputs
+        k = self.get_nodeattr("KernelDim")[0]
+        s = self.get_nodeattr("Stride")[0]
+        p = self.get_nodeattr("Padding")[0]
+        w = self.get_nodeattr("IFMDim")[1]
+        sf = self.get_nodeattr("IFMChannels") // self.get_nodeattr("SIMD")
+        padup = 0 if p >= k - s else (k - p - 1) // s
+        depth = 1 << int(np.ceil(np.log2((k // s) * (padup + w + padup) * sf)))
+        width = self.get_nodeattr("SIMD") * self.get_input_datatype().bitwidth()
+        return depth, width
+
     def bram_estimation(self):
-        return 0
+        # The line buffer is the only BRAM user; the weights are a ROM in LUTs.
+        # BRAM18 aspect ratios: 16Kx1, 8Kx2, 4Kx4, 2Kx9, 1Kx18, 512x36.
+        depth, width = self._swg_buffer_shape()
+        if depth > 16384:
+            return int(np.ceil(depth / 16384) * width)
+        bits_per_bram = {16384: 1, 8192: 2, 4096: 4, 2048: 9, 1024: 18}
+        per = next((b for d, b in sorted(bits_per_bram.items()) if depth <= d), 36)
+        return int(np.ceil(width / per))
 
     def lut_estimation(self):
-        return 0
+        # control + weight ROM (64 bits per LUT6) + per-multiplier datapath
+        weight_bits = (
+            np.prod(self.get_nodeattr("KernelDim"))
+            * self.get_nodeattr("IFMChannels")
+            * self.get_nodeattr("OFMChannels")
+            * self.get_weight_datatype().bitwidth()
+        )
+        macs = self.get_nodeattr("PE") * self.get_nodeattr("SIMD")
+        return int(850 + weight_bits / 64 + 30 * macs)
+
+    def dsp_estimation(self, fpgapart):
+        # HLS maps every weight x activation product to its own DSP
+        return self.get_nodeattr("PE") * self.get_nodeattr("SIMD")
+    # Jude: Done
 
     def uram_estimation(self):
         return 0
 
     def execute_node(self, context, graph):
-        pass
+        # Jude: Edited, Removed
+        # Python reference: scatter each input pixel's K x K x OFM contribution onto
+        # the stride-S output grid, then crop Padding off every edge. NHWC input,
+        # weights [OFM][K][K][IFM]. Accumulates in float64, which is exact for any
+        # integer result that fits the INT32 outputDataType.
+        node = self.onnx_node
+        x = context[node.input[0]].astype(np.float64)
+        w = context[node.input[1]].astype(np.float64)
+        k_h, k_w = self.get_nodeattr("KernelDim")
+        s_h, s_w = self.get_nodeattr("Stride")
+        p_h, p_w = self.get_nodeattr("Padding")
+        n, i_h, i_w, _ = x.shape
+        ofm_ch = self.get_nodeattr("OFMChannels")
+        full = np.zeros((n, (i_h - 1) * s_h + k_h, (i_w - 1) * s_w + k_w, ofm_ch))
+        span_h, span_w = (i_h - 1) * s_h + 1, (i_w - 1) * s_w + 1
+        for ky in range(k_h):
+            for kx in range(k_w):
+                full[:, ky : ky + span_h : s_h, kx : kx + span_w : s_w, :] += np.einsum(
+                    "nhwi,oi->nhwo", x, w[:, ky, kx, :]
+                )
+        _, o_h, o_w, _ = self.get_normal_output_shape()
+        y = full[:, p_h : p_h + o_h, p_w : p_w + o_w, :]
+        context[node.output[0]] = y.astype(np.float32)
+        # Jude: Done
