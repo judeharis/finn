@@ -13,9 +13,14 @@ import os
 import os.path
 import re
 from finn_xsi.sim_engine import SimEngine
+from finn_xsi.srcutil import order_pkg_first
 from typing import Optional
 
-from finn.util.basic import launch_process_helper
+from finn.util.basic import (
+    get_rtlsim_timeout_error_message,
+    launch_process_helper,
+    resolve_xilinx_tool,
+)
 
 
 def locate_glbl() -> Optional[str]:
@@ -45,7 +50,9 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         }
         verilog_header_incl_str = " ".join(["--include " + x for x in verilog_headers])
 
-        for src_line in source_list:
+        # packages must come before the modules that import them
+        srcs_list = order_pkg_first(source_list)
+        for src_line in srcs_list:
             if src_line.endswith(".v"):
                 f.write(f"verilog work {verilog_header_incl_str} {src_line}\n")
             elif src_line.endswith(".vhd"):
@@ -80,10 +87,12 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         "floating_point_v7_1_18",
         "floating_point_v7_1_15",
         "floating_point_v7_1_19",
+        "floating_point_v7_1_21",
+        "floating_point_v7_0_26",
     ]
 
     cmd_xelab = [
-        "xelab",
+        resolve_xilinx_tool("xelab"),
         "work." + top_module_name,
         "-relax",
         "-prj",
@@ -92,11 +101,17 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
         "-s",
         top_module_name,
     ]
-    # Add debug flag if debug is enabled
+    # Xelab defaults to "auto" threading, which can expand to hundreds of
+    # workers on shared servers. Large stitched FINNLoop designs have shown
+    # intermittent elaborator SIGABRTs in that mode, so keep the default
+    # bounded while still allowing explicit override.
+    xelab_mt = os.environ.get("FINN_XELAB_MT", os.environ.get("NUM_DEFAULT_WORKERS", "8"))
+    if xelab_mt == "1":
+        xelab_mt = "off"
+    cmd_xelab.extend(["--mt", xelab_mt])
     if debug:
         cmd_xelab.append("-debug")
         cmd_xelab.append("all")
-    # Add behavioural simulation flag if behav is enabled
     if behav:
         cmd_xelab.append("-define")
         cmd_xelab.append("FINN_SIMULATION")
@@ -107,7 +122,8 @@ def compile_sim_obj(top_module_name, source_list, sim_out_dir, debug=False, beha
     if locate_glbl() is not None:
         cmd_xelab.insert(1, "work.glbl")
 
-    launch_process_helper(cmd_xelab, cwd=sim_out_dir)
+    # check=True so an xelab failure is raised here, not later as a missing xsimk.so
+    launch_process_helper(cmd_xelab, cwd=sim_out_dir, check=True)
     out_so_relative_path = "xsim.dir/%s/xsimk.so" % top_module_name
     out_so_full_path = sim_out_dir + "/" + out_so_relative_path
 
@@ -149,6 +165,17 @@ def reset_rtlsim(
 
 
 def close_rtlsim(sim):
+    sim_finish = sim.top.getPort("sim_finish")
+    if sim_finish is not None:
+        sim_finish.set(1).write_back()
+        sim.cycle({})
+    # Explicitly finalize the design (calls xsi_close -> flushes+closes the .wdb)
+    # instead of relying on GC of sim.top. Port back-refs and the pybind use_map
+    # can keep the Design alive past `del sim`, so without this the waveform can
+    # be left unflushed on a timeout/pdb exit, corrupting its trace tail.
+    close = getattr(sim.top, "close", None)
+    if close is not None:
+        close()
     del sim
 
 
@@ -158,6 +185,7 @@ def rtlsim_multi_io(
     num_out_values,
     sname="_V_V",
     liveness_threshold=10000,
+    liveness_estimate=None,
 ):
     if len(io_dict["outputs"]) > 1:
         assert isinstance(
@@ -181,20 +209,37 @@ def rtlsim_multi_io(
         sim.stream_input(stream_name, hexstring_input)
 
     hex_output_streams = {}
+    watchdogs = []
     for out in io_dict["outputs"]:
         stream_name = out + sname
+        watchdog = sim.create_watchdog(f"{stream_name} timeout", liveness_threshold)
+        watchdogs.append(watchdog)
         hex_output_streams[out] = sim.collect_output(
             stream_name,
             num_out_values[out],
-            watchdog=sim.create_watchdog(f"{stream_name} timeout", liveness_threshold),
+            watchdog=watchdog,
         )
 
     start_ticks = sim.ticks
-    ret = sim.run()
-    if len(ret) > 0:
-        assert False, f"RTL simulation watchdogs {str(ret)} timed out. Check rtlsim_trace if any."
-    end_ticks = sim.ticks
-    for out in io_dict["outputs"]:
-        io_dict["outputs"][out] = list(map(lambda var: int(var, base=16), hex_output_streams[out]))
+    try:
+        ret = sim.run()
+        if len(ret) > 0:
+            assert False, (
+                get_rtlsim_timeout_error_message(liveness_threshold, liveness_estimate)
+                + f" Triggered watchdogs: {str(ret)}. Check rtlsim_trace if any."
+            )
+        end_ticks = sim.ticks
+        for out in io_dict["outputs"]:
+            io_dict["outputs"][out] = list(
+                map(lambda var: int(var, base=16), hex_output_streams[out])
+            )
+    finally:
+        # Remove the per-output watchdogs so they do not outlive this data pass.
+        # sim.watchdogs is persistent; a leftover (already-exhausted) watchdog
+        # would keep ticking and prematurely abort any later sim.run(), e.g. a
+        # post-hook AXI-Lite weight read-back (see test_fpgadataflow_mvau).
+        for watchdog in watchdogs:
+            if watchdog in sim.watchdogs:
+                sim.remove_watchdog(watchdog)
 
     return end_ticks - start_ticks

@@ -26,6 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import json
 import numpy as np
 import os
 from qonnx.custom_op.registry import getCustomOp
@@ -33,26 +34,45 @@ from qonnx.custom_op.registry import getCustomOp
 from finn import xsi
 from finn.util.basic import (
     get_finn_root,
-    get_liveness_threshold_cycles,
+    get_rtlsim_timeout_error_message,
     get_vivado_root,
+    get_watchdog_timeout_cycles,
     launch_process_helper,
     make_build_dir,
 )
 from finn.util.data_packing import npy_to_rtlsim_input, rtlsim_output_to_npy
+from finn.util.rtlsim import dat_file_to_numpy_array, mlo_prehook_func_factory
 
 finnxsi = xsi if xsi.is_available() else None
+
+
+def has_s_axis_port(node_onnx, node_inp_ind):
+    """Whether input `node_inp_ind` of `node_onnx` is backed by an s_axis port.
+
+    Mirrors the skip rule in CreateStitchedIP.connect_s_axis_external: an input
+    beyond the node's declared s_axis interfaces gets no external port and does
+    not consume an s_axis_<n> index. Requant_rtl in MLO mode is such a case, as
+    it packs its bias (input[2]) into the input[1] parameter memstream.
+    """
+    s_axis_names = getCustomOp(node_onnx).get_verilog_top_module_intf_names()["s_axis"]
+    return node_inp_ind < len(s_axis_names)
 
 
 def prep_rtlsim_io_dict(model, execution_context):
     # extract i/o info to prepare io_dict
     io_dict = {"inputs": {}, "outputs": {}}
     if_dict = eval(model.get_metadata_prop("vivado_stitch_ifnames"))
-    # go over and prepare inputs
-    for i, i_vi in enumerate(model.graph.input):
+    # go over and prepare inputs, skipping those without an s_axis port so that
+    # the rest stay aligned with if_dict
+    i = -1
+    for i_vi in model.graph.input:
         i_name = i_vi.name
+        first_node_onnx = model.find_consumer(i_name)
+        if not has_s_axis_port(first_node_onnx, list(first_node_onnx.input).index(i_name)):
+            continue
+        i += 1
         i_tensor = execution_context[i_name]
         i_dt = model.get_tensor_datatype(i_name)
-        first_node_onnx = model.find_consumer(i_name)
         first_node = getCustomOp(first_node_onnx)
         node_inp_ind = list(first_node_onnx.input).index(i_name)
         if node_inp_ind == 0:
@@ -123,29 +143,38 @@ def rtlsim_exec_cppxsi(
     dummy_data_mode=False,
     timeout_cycles=None,
     throttle_cycles=0,
+    behav=True,
 ):
     """Use XSI C++ rtl simulation to execute given model with stitched IP.
+
     The dummy_data_mode flag controls whether the simulation is driven by
     dummy data or real data. The execution_context parameter must be formatted
     according to whether dummy or real data is used.
-    Example with dummy_data = True:
+    If behav=True (default), FINN_SIMULATION is defined and fifo_gauge is used.
+    If behav=False, the synthesizable fifo.sv is used instead (no debug logging).
+
+    Example with dummy_data = True::
+
         execution_context = {
             "inputs" : {"<name_of_input_stream>" : <number_of_transactions>},
             "outputs" : {"<name_of_output_stream>" : <number_of_transactions>},
         }
-    Example with dummy_data = False:
+
+    Example with dummy_data = False::
+
         execution_context = {
             "<tensor_name>" : <np.ndarray>
         }
 
-    If timeout_cycles is not None, the default value from get_liveness_threshold_cycles
-    will be used.
+    If timeout_cycles is None, the LIVENESS_THRESHOLD override alone is used.
+    Otherwise, timeout_cycles is treated as the derived estimate and
+    LIVENESS_THRESHOLD can only increase it.
     throttle_cycles will be used to pause the input stream every time an input frame is finished.
     """
     # TODO: support running functional rtlsim with real I/O data
     # TODO: support running with multiple inputs/outputs
-    if timeout_cycles is None:
-        timeout_cycles = get_liveness_threshold_cycles()
+    timeout_estimate = timeout_cycles
+    timeout_cycles = get_watchdog_timeout_cycles(timeout_estimate)
 
     assert dummy_data_mode, "Only dummy_data_mode=True is supported for now"
 
@@ -176,7 +205,7 @@ def rtlsim_exec_cppxsi(
         single_src_dir = make_build_dir("rtlsim_" + top_module_name + "_")
         debug = not (trace_file is None or trace_file == "")
         rtlsim_so = finnxsi.compile_sim_obj(
-            top_module_name, all_verilog_srcs, single_src_dir, debug=debug, behav=True
+            top_module_name, all_verilog_srcs, single_src_dir, debug=debug, behav=behav
         )
         # save generated lib filename in attribute
         model.set_metadata_prop("rtlsim_so", rtlsim_so[0] + "/" + rtlsim_so[1])
@@ -201,6 +230,9 @@ def rtlsim_exec_cppxsi(
         assert first_node is not None, "Failed to find consumer for " + iname
         fnode_inst = getCustomOp(first_node)
         top_ind = list(first_node.input).index(iname)
+        # skip inputs without an s_axis port to stay aligned with ifnames below
+        if not has_s_axis_port(first_node, top_ind):
+            continue
         ishape_folded = fnode_inst.get_folded_input_shape(ind=top_ind)
         instream_iters.append(np.prod(ishape_folded[:-1]))
     for top_out in model.graph.output:
@@ -215,8 +247,8 @@ def rtlsim_exec_cppxsi(
     # retrieve the number of inputs from execution_context
     n_inferences = execution_context[model.get_first_global_in()]
     ifnames = model.get_metadata_prop("vivado_stitch_ifnames")
-    assert not (
-        ifnames is None
+    assert (
+        ifnames is not None
     ), "Couldn't find stitched-IP interface names, did you run IP stitching first?"
     ifnames = eval(ifnames)
     if "aximm" in ifnames.keys() and ifnames["aximm"] != []:
@@ -225,6 +257,12 @@ def rtlsim_exec_cppxsi(
         ), f"cppxsi sim doesn't know how to handle full AXI MM interfaces: {ifnames['aximm']}"
     instream_names = [x[0] for x in ifnames["s_axis"]]
     outstream_names = [x[0] for x in ifnames["m_axis"]]
+    assert len(instream_names) == len(
+        instream_iters
+    ), "stitched-IP s_axis ports (%d) don't match streamed graph inputs (%d)" % (
+        len(instream_names),
+        len(instream_iters),
+    )
     instream_descrs = [
         (instream_names[i], instream_iters[i], instream_iters[i] + throttle_cycles)
         for i in range(len(instream_names))
@@ -292,8 +330,11 @@ def rtlsim_exec_cppxsi(
     runsim_env["LD_LIBRARY_PATH"] = get_vivado_root() + "/lib/lnx64.o"
     runsim_cmd = ["bash", "run_rtlsim.sh"]
     with open(sim_base + "/run_rtlsim.sh", "w") as f:
+        ld_path = runsim_env["LD_LIBRARY_PATH"]
         f.write(
-            f"LD_LIBRARY_PATH={runsim_env['LD_LIBRARY_PATH']} ./rtlsim_xsi > rtlsim_xsi_log.txt"
+            f"LD_LIBRARY_PATH={ld_path}"
+            " ./rtlsim_xsi > rtlsim_xsi_log.txt"
+            " 2> rtlsim_xsi_stderr.log"
         )
     launch_process_helper(runsim_cmd, cwd=sim_base)
 
@@ -306,7 +347,10 @@ def rtlsim_exec_cppxsi(
         key, val = result_line.split("\t")
         ret_dict[key] = int(val)
     if "TIMEOUT" in ret_dict.keys():
-        assert ret_dict["TIMEOUT"] == 0, f"XSI C++ simulation timed out, see {results_filename}"
+        assert ret_dict["TIMEOUT"] == 0, (
+            get_rtlsim_timeout_error_message(timeout_cycles, timeout_estimate)
+            + f" See {results_filename} for simulation details."
+        )
     return ret_dict
 
 
@@ -341,8 +385,10 @@ def rtlsim_exec_finnxsi(model, execution_context, pre_hook=None, post_hook=None)
         top_module_name = top_module_file_name.strip(".v")
         single_src_dir = make_build_dir("rtlsim_" + top_module_name + "_")
         debug = not (trace_file is None or trace_file == "")
+        rtlsim_behavioral = model.get_metadata_prop("rtlsim_behavioral")
+        behav = rtlsim_behavioral is not None and rtlsim_behavioral == "1"
         rtlsim_so = finnxsi.compile_sim_obj(
-            top_module_name, all_verilog_srcs, single_src_dir, debug=debug
+            top_module_name, all_verilog_srcs, single_src_dir, debug=debug, behav=behav
         )
         # save generated lib filename in attribute
         model.set_metadata_prop("rtlsim_so", rtlsim_so[0] + "/" + rtlsim_so[1])
@@ -358,14 +404,43 @@ def rtlsim_exec_finnxsi(model, execution_context, pre_hook=None, post_hook=None)
 
     # reset and call rtlsim, including any pre/post hooks
     finnxsi.reset_rtlsim(sim)
+
+    # automatically load AXI-MM weight images for external_mem nodes
+    aximm_weights_json = model.get_metadata_prop("vivado_stitch_aximm_weights")
+    if aximm_weights_json is not None:
+        aximm_weights = json.loads(aximm_weights_json)
+        for aximm_name, dat_path in aximm_weights.items():
+            # memblock.dat stores weights byte-aligned per SIMD group
+            # (roundup(SIMD*bitwidth, 8) bits per group), the layout fetch_weights
+            # expects in external memory (DDR, HBM, ...). Parse it (LSB-first) into a
+            # flat byte image, matching the validated MLO path in mlo_sim.py.
+            weight_data = dat_file_to_numpy_array(dat_path)
+            sim.aximm_ro_image(aximm_name, 0, weight_data.flatten())
+
+    if pre_hook is None:
+        # FINNLoop (MLO) models need their weight memories initialized via a pre-hook
+        finnloop_nodes = model.get_nodes_by_op_type("FINNLoop")
+        if len(finnloop_nodes) == 1:
+            pre_hook = mlo_prehook_func_factory(finnloop_nodes[0])
+        elif len(finnloop_nodes) > 1:
+            raise NotImplementedError(
+                "rtlsim of models with multiple FINNLoop nodes is not supported"
+            )
     if pre_hook is not None:
         pre_hook(sim)
+    liveness_estimate = model.get_metadata_prop("rtlsim_liveness_estimate")
+    if liveness_estimate is not None:
+        liveness_estimate = int(liveness_estimate)
+    liveness_threshold = get_watchdog_timeout_cycles(liveness_estimate) * batchsize
+    if liveness_estimate is not None:
+        liveness_estimate *= batchsize
     n_cycles = finnxsi.rtlsim_multi_io(
         sim,
         io_dict,
         num_out_values,
         sname="",
-        liveness_threshold=get_liveness_threshold_cycles() * batchsize,
+        liveness_threshold=liveness_threshold,
+        liveness_estimate=liveness_estimate,
     )
     if post_hook is not None:
         post_hook(sim)

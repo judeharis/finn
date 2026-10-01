@@ -22,7 +22,11 @@ class InnerShuffle(HWCustomOp):
     def get_nodeattr_types(self):
         my_attrs = {
             "data_type": ("s", True, ""),
-            "in_shape": ("ints", True, []),  # Needs to be len==2 can we assert that somewhere?
+            # Physical/normal input shape - matches the actual input tensor.
+            "in_shape": ("ints", True, []),
+            # Logical shape the transpose acts on (in_shape after any fused
+            # reshape). Equals in_shape when no reshape was fused.
+            "transpose_in_shape": ("ints", True, []),
             "SIMD": ("i", False, 1),
             "original_node_name": ("s", False, ""),  # Track original shuffle name for SIMD config
             "original_simd": ("i", False, 1),  # Track original shuffle SIMD for config export
@@ -34,12 +38,16 @@ class InnerShuffle(HWCustomOp):
         return self.get_nodeattr("in_shape")
 
     def get_normal_output_shape(self, ind=0):
-        ishape = tuple(self.get_normal_input_shape())
-        return ishape[:-2] + (ishape[-1], ishape[-2])
+        tshape = tuple(self.get_nodeattr("transpose_in_shape"))
+        return tshape[:-2] + (tshape[-1], tshape[-2])
 
     def execute_node(self, context, graph):
         node = self.onnx_node
         input_data = context[node.input[0]]
+        # The tensor arrives in its physical shape; reshape to the logical view
+        # the transpose acts on (identical data in row-major order).
+        in_shape = self.get_nodeattr("transpose_in_shape")
+        input_data = input_data.reshape(in_shape)
         assert len(input_data.shape) >= 2, "InnerShuffle HWCustomOp requires at least 2D input"
         # Transpose only the last two dimensions: (..., a, b) -> (..., b, a)
         axes = list(range(len(input_data.shape)))
@@ -90,3 +98,19 @@ class InnerShuffle(HWCustomOp):
         fold = int(np.prod(normal_ishape) / simd)
         folded_ishape = [fold, simd]
         return tuple(folded_ishape)
+
+    def get_exp_cycles(self):
+        """Estimate cycles for the double-buffered InnerShuffle RTL.
+
+        The RTL uses two BRAM banks with page_size = I*J/SIMD. The first page
+        must be fully written before reads can begin, adding one extra page of
+        latency beyond the streaming throughput. Empirically verified to match
+        cycles_rtlsim within atol=10.
+        """
+        in_shape = self.get_nodeattr("transpose_in_shape")
+        simd = self.get_nodeattr("SIMD")
+        I_dim = in_shape[-2]
+        J_dim = in_shape[-1]
+        page_size = I_dim * J_dim // simd
+        total_elems = int(np.prod(in_shape)) // simd
+        return 2 * total_elems + page_size

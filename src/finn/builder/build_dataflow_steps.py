@@ -27,6 +27,23 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+"""
+Fine-grained steps for the FINN dataflow builder pipeline.
+
+Each step is a ``(model, cfg) -> model`` function that performs one part of the
+build (e.g. ``step_tidy_up``, ``step_convert_to_hw``, ``step_hw_ipgen``). The
+available steps are registered in ``build_dataflow_step_lookup`` so they can be
+referenced by name in a build configuration's ``steps`` list.
+
+The default build flow does not list these steps individually. Instead it groups
+them into a handful of logical phases defined in
+:py:mod:`finn.builder.build_dataflow_phases` (see ``default_build_dataflow_steps``
+in :py:mod:`finn.builder.build_dataflow_config`). Standard (non-MLO) builds can
+still compose these fine-grained steps directly, or mix phases and steps, for
+custom pipelines. Models using multi-level offloading (MLO / ``FINNLoop`` nodes)
+must use the phases, since the loop-body orchestration lives there.
+"""
+
 import json
 import numpy as np
 import os
@@ -47,8 +64,9 @@ from qonnx.transformation.infer_data_layouts import InferDataLayouts
 from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.transformation.infer_shapes import InferShapes
 from qonnx.transformation.lower_convs_to_matmul import LowerConvsToMatMul
+from qonnx.util.basic import get_by_name
 from qonnx.util.cleanup import cleanup_model
-from shutil import copy, move
+from shutil import copy
 
 import finn.transformation.fpgadataflow.convert_to_hw_layers as to_hw
 import finn.transformation.streamline.absorb as absorb
@@ -64,6 +82,9 @@ from finn.analysis.fpgadataflow.res_estimation import (
     res_estimation,
     res_estimation_complete,
 )
+from finn.analysis.fpgadataflow.validate_dataflow_conversion import (
+    validate_dataflow_conversion,
+)
 from finn.builder.build_dataflow_config import (
     DataflowBuildConfig,
     DataflowOutputType,
@@ -71,8 +92,18 @@ from finn.builder.build_dataflow_config import (
     VerificationStepType,
 )
 from finn.core.onnx_exec import execute_onnx
-from finn.core.rtlsim_exec import rtlsim_exec
+from finn.transformation.fpgadataflow.absorb_into_requant import (
+    AbsorbElementwiseOpsIntoRequant,
+)
+from finn.transformation.fpgadataflow.alveo_build import (
+    PrepareForLinking,
+    SlashLink,
+    VitisLink,
+)
 from finn.transformation.fpgadataflow.annotate_cycles import AnnotateCycles
+from finn.transformation.fpgadataflow.assign_ddr_weight_offsets import (
+    AssignMemoryOffset,
+)
 from finn.transformation.fpgadataflow.compile_cppsim import CompileCppSim
 from finn.transformation.fpgadataflow.create_dataflow_partition import (
     CreateDataflowPartition,
@@ -82,6 +113,7 @@ from finn.transformation.fpgadataflow.derive_characteristic import (
     DeriveCharacteristic,
     DeriveFIFOSizes,
 )
+from finn.transformation.fpgadataflow.export_portable_rtl import ExportPortableRTL
 from finn.transformation.fpgadataflow.hlssynth_ip import HLSSynthIP
 from finn.transformation.fpgadataflow.insert_dwc import InsertDWC
 from finn.transformation.fpgadataflow.insert_fifo import InsertFIFO
@@ -104,18 +136,15 @@ from finn.transformation.fpgadataflow.set_exec_mode import SetExecMode
 from finn.transformation.fpgadataflow.set_fifo_depths import (
     InsertAndSetFIFODepths,
     RemoveShallowFIFOs,
-    SplitLargeFIFOs,
     xsi_fifosim,
 )
 from finn.transformation.fpgadataflow.set_folding import SetFolding
 from finn.transformation.fpgadataflow.set_loop_boundary import SetLoopBoundary
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
-from finn.transformation.fpgadataflow.synth_ooc import SynthOutOfContext
 from finn.transformation.fpgadataflow.transpose_decomposition import (
     InferInnerOuterShuffles,
     ShuffleDecomposition,
 )
-from finn.transformation.fpgadataflow.vitis_build import VitisBuild
 from finn.transformation.general import ApplyConfig
 from finn.transformation.move_reshape import RemoveCNVtoFCFlatten
 from finn.transformation.qonnx.convert_qonnx_to_finn import ConvertQONNXtoFINN
@@ -125,13 +154,49 @@ from finn.transformation.qonnx.quant_act_to_multithreshold import (
 from finn.transformation.streamline import Streamline
 from finn.transformation.streamline.reorder import MakeMaxPoolNHWC
 from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
-from finn.util.basic import get_liveness_threshold_cycles, get_rtlsim_trace_depth
+from finn.util.basic import get_rtlsim_trace_depth
 from finn.util.config import (
     extract_model_config_consolidate_shuffles,
     extract_model_config_to_json,
 )
-from finn.util.mlo_sim import is_mlo, mlo_prehook_func_factory
+from finn.util.fpgadataflow import is_mlo, warn_hls_rtl_dsp_conflict
+from finn.util.rtlsim import annotate_rtlsim_performance
 from finn.util.test import execute_parent
+from finn.util.vivado import parse_ooc_synth_results
+
+
+def _maybe_enable_verify_behavioral(cfg):
+    if cfg.debug_fifo and not cfg.verify_rtlsim_behavioral:
+        print(
+            "[debug_fifo] forcing verify_rtlsim_behavioral=True so that "
+            "the verify phase uses fifo_gauge and produces per-FIFO logs."
+        )
+        cfg.verify_rtlsim_behavioral = True
+
+
+def _fifo_debug_live_dir(cfg):
+    return cfg.output_dir + "/debug/fifo_logs/_live"
+
+
+def snapshot_fifo_logs(cfg, phase_name, loop_context=None):
+    if not cfg.debug_fifo:
+        return
+    live_dir = _fifo_debug_live_dir(cfg)
+    if not os.path.isdir(live_dir):
+        return
+    prefix = (loop_context + "_") if loop_context else None
+    subdir = loop_context or "main"
+    dest_dir = os.path.join(cfg.output_dir, "debug", "fifo_logs", phase_name, subdir)
+    os.makedirs(dest_dir, exist_ok=True)
+    for fn in os.listdir(live_dir):
+        if not fn.endswith(".log"):
+            continue
+        if prefix is not None and not fn.startswith(prefix):
+            continue
+        src = os.path.join(live_dir, fn)
+        dst = os.path.join(dest_dir, fn)
+        shutil.copy2(src, dst)
+        open(src, "w").close()
 
 
 def verify_step(
@@ -139,7 +204,6 @@ def verify_step(
     cfg: DataflowBuildConfig,
     step_name: str,
     need_parent: bool,
-    rtlsim_pre_hook=None,
 ):
     print("Running verification for " + step_name)
     verify_out_dir = cfg.output_dir + "/verification_output"
@@ -150,9 +214,14 @@ def verify_step(
     bsize_out = exp_out_npy_all.shape[0]
     assert bsize_in == bsize_out, "Batch sizes don't match for verification IO pair"
     all_res = True
-    for b in range(bsize_in):
-        in_npy = np.expand_dims(in_npy_all[b], axis=0)
-        exp_out_npy = np.expand_dims(exp_out_npy_all[b], axis=0)
+    # Verification runs one frame at a time (execute_onnx only accepts a single
+    # frame), so split the batched IO array into single-frame chunks. Batched
+    # multi-frame rtlsim is still possible by calling rtlsim_exec directly.
+    chunks = [
+        (np.expand_dims(in_npy_all[b], axis=0), np.expand_dims(exp_out_npy_all[b], axis=0), b)
+        for b in range(bsize_in)
+    ]
+    for in_npy, exp_out_npy, index in chunks:
         if need_parent:
             assert cfg.save_intermediate_models, "Enable save_intermediate_models for verification"
             parent_model_fn = intermediate_models_dir + "/dataflow_parent.onnx"
@@ -160,34 +229,32 @@ def verify_step(
             model.save(child_model_fn)
             parent_model = ModelWrapper(parent_model_fn)
             out_tensor_name = parent_model.get_first_global_out()
-            exp_ishape = parent_model.get_tensor_shape(parent_model.get_first_global_in())
-            if in_npy.shape != exp_ishape:
+            exp_ishape = tuple(parent_model.get_tensor_shape(parent_model.get_first_global_in()))
+            target_ishape = (in_npy.shape[0],) + exp_ishape[1:]
+            if in_npy.shape != target_ishape:
                 print(
                     "Verification input has shape %s while model expects %s"
-                    % (str(in_npy.shape), str(exp_ishape))
+                    % (str(in_npy.shape), str(target_ishape))
                 )
                 print("Attempting to force model shape on verification input")
-                in_npy = in_npy.reshape(exp_ishape)
+                in_npy = in_npy.reshape(target_ishape)
             out_dict = execute_parent(parent_model_fn, child_model_fn, in_npy, return_full_ctx=True)
             out_npy = out_dict[out_tensor_name]
         else:
             inp_tensor_name = model.get_first_global_in()
             out_tensor_name = model.get_first_global_out()
-            exp_ishape = model.get_tensor_shape(inp_tensor_name)
-            if in_npy.shape != exp_ishape:
+            exp_ishape = tuple(model.get_tensor_shape(inp_tensor_name))
+            target_ishape = (in_npy.shape[0],) + exp_ishape[1:]
+            if in_npy.shape != target_ishape:
                 print(
                     "Verification input has shape %s while model expects %s"
-                    % (str(in_npy.shape), str(exp_ishape))
+                    % (str(in_npy.shape), str(target_ishape))
                 )
                 print("Attempting to force model shape on verification input")
-                in_npy = in_npy.reshape(exp_ishape)
+                in_npy = in_npy.reshape(target_ishape)
             inp_dict = {inp_tensor_name: in_npy}
-            if rtlsim_pre_hook is not None:
-                rtlsim_exec(model, inp_dict, pre_hook=rtlsim_pre_hook)
-                out_npy = inp_dict[out_tensor_name]
-            else:
-                out_dict = execute_onnx(model, inp_dict, True)
-                out_npy = out_dict[out_tensor_name]
+            out_dict = execute_onnx(model, inp_dict, True)
+            out_npy = out_dict[out_tensor_name]
         exp_oshape = exp_out_npy.shape
         if out_npy.shape != exp_oshape:
             print(
@@ -205,119 +272,45 @@ def verify_step(
         all_res = all_res and res
         res_to_str = {True: "SUCCESS", False: "FAIL"}
         res_str = res_to_str[res]
-        if cfg.verify_save_full_context and (rtlsim_pre_hook is None):
+        if cfg.verify_save_full_context:
             verification_output_fn = verify_out_dir + "/verify_%s_%d_%s.npz" % (
                 step_name,
-                b,
+                index,
                 res_str,
             )
             np.savez(verification_output_fn, **out_dict)
         else:
-            if cfg.verify_save_full_context:
-                print("Warning: Unable to save the full context when using MLO")
             verification_output_fn = verify_out_dir + "/verify_%s_%d_%s.npy" % (
                 step_name,
-                b,
+                index,
                 res_str,
             )
             np.save(verification_output_fn, out_npy)
 
         if cfg.verify_save_rtlsim_waveforms:
+            # Handle model-level waveform (stitched IP rtlsim)
             wdb_path = model.get_metadata_prop("rtlsim_trace")
             if wdb_path is not None and os.path.isfile(wdb_path):
-                new_wdb_path = wdb_path.replace(".wdb", "_%d.wdb" % b)
+                new_wdb_path = wdb_path.replace(".wdb", "_%d.wdb" % index)
                 shutil.move(wdb_path, new_wdb_path)
+            # Handle node-level waveforms (only for node-by-node rtlsim)
+            if step_name == "node_by_node_rtlsim":
+                for node in model.graph.node:
+                    node_inst = getCustomOp(node)
+                    node_wdb_path = node_inst.get_nodeattr("rtlsim_trace")
+                    if node_wdb_path is not None and os.path.isfile(node_wdb_path):
+                        new_node_wdb_path = node_wdb_path.replace(".wdb", "_%d.wdb" % index)
+                        shutil.move(node_wdb_path, new_node_wdb_path)
 
     print("Verification for %s : %s" % (step_name, res_to_str[all_res]))
 
 
 def prepare_for_stitched_ip_rtlsim(verify_model, cfg):
-    if not cfg.rtlsim_use_vivado_comps:
-        need_restitch = False
-        # switch impl_style=vivado components to rtl
-        # StreamingFIFO must have impl_style=rtl
-        for fifo_layer in verify_model.get_nodes_by_op_type("StreamingFIFO_rtl"):
-            inst = getCustomOp(fifo_layer)
-            if inst.get_nodeattr("impl_style") != "rtl":
-                inst.set_nodeattr("impl_style", "rtl")
-                inst.set_nodeattr("code_gen_dir_ipgen", "")
-                inst.set_nodeattr("ipgen_path", "")
-                need_restitch = True
-        # if we've made alterations to the model, need to do some re-prep
-        if need_restitch:
-            print("Need to regen/re-stitch some IP for STITCHED_IP_RTLSIM")
-            verify_model = verify_model.transform(
-                PrepareIP(cfg._resolve_fpga_part(), cfg._resolve_hls_clk_period())
-            )
-            verify_model = verify_model.transform(HLSSynthIP(cfg._resolve_fpga_part()))
-            verify_model = verify_model.transform(
-                CreateStitchedIP(
-                    cfg._resolve_fpga_part(),
-                    cfg.synth_clk_period_ns,
-                    vitis=False,
-                )
-            )
-    else:
-        print("rtlsim_use_vivado_comps is enabled, may yield incorrect results")
-
     # set top-level prop for stitched-ip rtlsim and launch
     verify_model.set_metadata_prop("exec_mode", "rtlsim")
     # TODO make configurable
     # verify_model.set_metadata_prop("rtlsim_trace", "trace.vcd")
     return verify_model
-
-
-def prepare_loop_ops_fifo_sizing(node, cfg):
-    node_inst = getCustomOp(node)
-    loop_model = node_inst.get_nodeattr("body")
-    loop_model = loop_model.transform(GiveUniqueNodeNames(prefix=node.name + "_"))
-    # go first into subgraph to check if there are other loop ops
-    loop_nodes = loop_model.get_nodes_by_op_type("FINNLoop")
-    for loop_node in loop_nodes:
-        prepare_loop_ops_fifo_sizing(loop_node, cfg)
-    loop_model = loop_model.transform(
-        PrepareIP(cfg._resolve_fpga_part(), cfg._resolve_hls_clk_period())
-    )
-    loop_model = loop_model.transform(HLSSynthIP(cfg._resolve_hls_clk_period()))
-    loop_model = loop_model.transform(ReplaceVerilogRelPaths())
-    if cfg.fifosim_save_waveform:
-        report_dir = cfg.output_dir + "/report"
-        os.makedirs(report_dir, exist_ok=True)
-        loop_model.set_metadata_prop(
-            "rtlsim_trace", os.path.abspath(report_dir) + f"/{node.name}_fifosim_trace.wdb"
-        )
-    loop_model = loop_model.transform(
-        InsertAndSetFIFODepths(
-            cfg._resolve_fpga_part(),
-            cfg._resolve_hls_clk_period(),
-            swg_exception=cfg.default_swg_exception,
-            vivado_ram_style=cfg.large_fifo_mem_style,
-            fifosim_input_throttle=cfg.fifosim_input_throttle,
-        )
-    )
-    loop_model = loop_model.transform(SplitLargeFIFOs())
-    loop_model = loop_model.transform(RemoveShallowFIFOs())
-    loop_model = loop_model.transform(GiveUniqueNodeNames(prefix=node.name + "_"))
-    loop_model = loop_model.transform(GiveReadableTensorNames())
-    node_inst.set_nodeattr("body", loop_model.graph)
-
-
-def prepare_loop_ops_ipgen(node, cfg):
-    node_inst = getCustomOp(node)
-    loop_model = node_inst.get_nodeattr("body")
-    # go first into subgraph to check if there are other loop ops
-    loop_nodes = loop_model.get_nodes_by_op_type("FINNLoop")
-    for loop_node in loop_nodes:
-        prepare_loop_ops_ipgen(loop_node, cfg)
-    loop_model = loop_model.transform(HLSSynthIP(cfg._resolve_hls_clk_period()))
-    loop_model = loop_model.transform(
-        CreateStitchedIP(
-            cfg._resolve_fpga_part(),
-            cfg.synth_clk_period_ns,
-            vitis=False,
-        )
-    )
-    node_inst.set_nodeattr("body", loop_model.graph)
 
 
 def step_qonnx_to_finn(model: ModelWrapper, cfg: DataflowBuildConfig):
@@ -377,7 +370,7 @@ def step_streamline(model: ModelWrapper, cfg: DataflowBuildConfig):
     topologies.
     """
 
-    model = model.transform(absorb.AbsorbSignBiasIntoMultiThreshold())
+    model = model.transform(absorb.AbsorbScalarBiasIntoMultiThreshold())
     model = model.transform(Streamline())
     need_lowering = len(model.get_nodes_by_op_type("Conv")) > 0
     if need_lowering:
@@ -403,43 +396,197 @@ def step_convert_to_hw(model: ModelWrapper, cfg: DataflowBuildConfig):
     """Convert eligible nodes to `HWCustomOp` subclasses that represent HW
     layers. Which nodes and particular configurations can be converted to HW
     is limited, see the source code of the `convert_to_hw` module for more.
-    In the end am empty json file is created which can be used to set user specific
-    preferred implementation styles for each node."""
+    In the end an empty json file is created which can be used to set user specific
+    preferred implementation styles for each node.
 
+    Finally, the conversion result is validated: all layers must be fpgadataflow
+    layers or form a contiguous dataflow block, otherwise an AssertionError is
+    raised naming the unconverted nodes."""
+
+    # Helper function to conditionally apply transformation
+    def apply_if_relevant(model, op_types, transform, desc=""):
+        # Check if any of the relevant op types exist in the model
+        if any(len(model.get_nodes_by_op_type(op_type)) > 0 for op_type in op_types):
+            if desc:
+                print(f"Converting {desc}...")
+            model = model.transform(transform)
+        return model
+
+    # Thresholding layers (standalone mode)
     if cfg.standalone_thresholds:
-        # doing this first causes all threshold layers to be standalone
-        model = model.transform(to_hw.InferThresholdingLayer())
+        # First: Convert high-bitwidth MultiThreshold and all Quant nodes to Requant
+        # Requant is more efficient for high bitwidths (simple multiply-add-round-clip
+        # vs comparison-based lookup with many thresholds)
+        # Note: bitwidth_threshold only applies to MultiThreshold, Quant is always converted
+        model = apply_if_relevant(
+            model,
+            ["MultiThreshold", "Quant"],
+            to_hw.InferRequantLayer(bitwidth_threshold=cfg.requant_bitwidth_threshold),
+            "high-bitwidth quantization as requant",
+        )
+        # Then: Convert remaining MultiThreshold to Thresholding
+        model = apply_if_relevant(
+            model,
+            ["MultiThreshold"],
+            to_hw.InferThresholdingLayer(),
+            "threshold layers (standalone)",
+        )
     else:
         print(
             """standalone_thresholds are set to False.
-            Please be aware that this means the MVAUs will be implemented in HLS
+            Please be aware that this means the MVAUs might be implemented in HLS
             because the RTL variant doesn't support the merge of
             MatMul + MultiThreshold into one layer. If you would like to have the RTL variant,
             please set standalone_thresholds to True."""
         )
-    # needed for bipolar MatMul layers
-    model = model.transform(to_hw.InferBinaryMatrixVectorActivation())
-    # needed for non-bipolar MatMul layers
-    model = model.transform(to_hw.InferQuantizedMatrixVectorActivation())
-    # TopK to LabelSelect
-    model = model.transform(to_hw.InferLabelSelectLayer())
-    # input quantization (if any) as standalone threshold
-    model = model.transform(to_hw.InferThresholdingLayer())
-    # needed for convolutions -- TODO always exec?
-    need_conv = len(model.get_nodes_by_op_type("Im2Col")) > 0
-    if need_conv:
-        model = model.transform(to_hw.InferPool())
-        model = model.transform(to_hw.InferConvInpGen())
-        model = model.transform(RemoveCNVtoFCFlatten())
-    # get rid of Tranpose -> Tranpose identity seq
+
+    # Matrix-vector operations
+    model = apply_if_relevant(
+        model,
+        ["XnorPopcountMatMul"],
+        to_hw.InferBinaryMatrixVectorActivation(),
+        "binary matmul layers",
+    )
+    model = apply_if_relevant(
+        model, ["MatMul"], to_hw.InferQuantizedMatrixVectorActivation(), "quantized matmul layers"
+    )
+    model = apply_if_relevant(
+        model, ["MatMul"], to_hw.InferVectorVectorActivation(), "vector-vector activation"
+    )
+
+    # Classification/output layers
+    model = apply_if_relevant(model, ["TopK"], to_hw.InferLabelSelectLayer(), "label select layers")
+
+    # Input quantization (if any) - high-bitwidth MultiThreshold and Quant as Requant,
+    # low-bitwidth MultiThreshold as Thresholding
+    model = apply_if_relevant(
+        model,
+        ["MultiThreshold", "Quant"],
+        to_hw.InferRequantLayer(bitwidth_threshold=cfg.requant_bitwidth_threshold),
+        "high-bitwidth input quantization as requant",
+    )
+    model = apply_if_relevant(
+        model, ["MultiThreshold"], to_hw.InferThresholdingLayer(), "threshold layers"
+    )
+
+    # Convolution-related transformations
+    model = apply_if_relevant(
+        model,
+        ["MaxPool", "AveragePool", "MaxPoolNHWC", "QuantAvgPool2d"],
+        to_hw.InferPool(),
+        "pooling layers",
+    )
+    model = apply_if_relevant(model, ["Im2Col"], to_hw.InferConvInpGen(), "conv input generator")
+    # If ConvInpGen derived, run remove cnv to fc flatten transform
+    model = apply_if_relevant(
+        model, ["ConvolutionInputGenerator"], RemoveCNVtoFCFlatten(), "Flatten"
+    )
+
+    # Streaming operations
+    model = apply_if_relevant(
+        model, ["Concat"], to_hw.InferPad1DLayer(), "1D padding and CLS token insertion"
+    )
+    model = apply_if_relevant(model, ["Concat"], to_hw.InferConcatLayer(), "concat layers")
+    model = apply_if_relevant(model, ["Split"], to_hw.InferSplitLayer(), "split layers")
+
+    # Elementwise operations
+    model = apply_if_relevant(
+        model,
+        [
+            "Mul",
+            "Div",
+            "Sub",
+            "Add",
+            "And",
+            "Or",
+            "Xor",
+            "Equal",
+            "Less",
+            "LessOrEqual",
+            "Greater",
+            "GreaterOrEqual",
+        ],
+        to_hw.InferElementwiseBinaryOperation(),
+        "elementwise binary operations",
+    )
+    model = apply_if_relevant(model, ["Where"], to_hw.InferWhereLayer(), "where selection")
+    model = apply_if_relevant(
+        model, ["Relu"], to_hw.InferReLUAsElementwiseMax(), "ReLU as elementwise max"
+    )
+
+    # Upsampling and resizing
+    model = apply_if_relevant(model, ["Upsample"], to_hw.InferUpsample(), "upsample layers")
+
+    # Global pooling
+    model = apply_if_relevant(
+        model, ["GlobalAveragePool"], to_hw.InferGlobalAccPoolLayer(), "global pooling"
+    )
+
+    # Gather-derived layers. SelectToken must run first because scalar Gather
+    # removes the selected axis, whereas the generic Crop keeps it.
+    model = apply_if_relevant(
+        model, ["Gather"], to_hw.InferSelectTokenLayer(), "token selection layers"
+    )
+    model = apply_if_relevant(model, ["Gather"], to_hw.InferCrop(), "crop layers")
+    model = apply_if_relevant(model, ["Gather"], to_hw.InferLookupLayer(), "lookup layers")
+
+    # Activation functions
+    model = apply_if_relevant(model, ["Softmax"], to_hw.InferHWSoftmax(), "softmax layers")
+    # Piecewise polynomial activations (GELU, SiLU, Sigmoid, Tanh)
+    model = apply_if_relevant(
+        model,
+        ["PWPolyF", "Gelu", "Sigmoid", "Tanh", "Erf"],
+        to_hw.InferPWPolyFLayer(),
+        "piecewise polynomial activations",
+    )
+
+    # Normalization layers
+    model = apply_if_relevant(
+        model, ["LayerNormalization"], to_hw.InferLayerNorm(), "layer normalization"
+    )
+
+    # Graph topology transformations (always check - not based on op_type)
+    # DuplicateStreams: detects forks where tensors have multiple consumers
+    print("Checking for graph forks (duplicate streams)...")
+    model = model.transform(to_hw.InferDuplicateStreamsLayer())
+
+    # Optimization: Absorb ElementwiseMul/Add into Requant
+    # This should be run after all HW layers are inferred
+    model = apply_if_relevant(
+        model,
+        ["Requant"],
+        AbsorbElementwiseOpsIntoRequant(),
+        "absorb elementwise ops into requant",
+    )
+
+    # Cleanup and post-processing transformations
+    # Get rid of Transpose -> Transpose identity sequences
     model = model.transform(absorb.AbsorbConsecutiveTransposes())
     model = model.transform(GiveUniqueNodeNames())
     model = model.transform(InferDataLayouts())
+
+    # Shuffle inference (should come after InferDataLayouts and handles Transpose+Reshape patterns)
     # InferShuffle skips first Transpose by default; override to convert all if disabled
     if cfg.infer_shuffle_skip_first:
-        model = model.transform(to_hw.InferShuffle())
+        model = apply_if_relevant(
+            model, ["Transpose"], to_hw.InferShuffle(), "shuffle/transpose layers"
+        )
     else:
-        model = model.transform(to_hw.InferShuffle(_filter=lambda *_: True))
+        model = apply_if_relevant(
+            model,
+            ["Transpose"],
+            to_hw.InferShuffle(_filter=lambda *_: True),
+            "shuffle/transpose layers",
+        )
+
+    # Validate that conversion succeeded: all layers must be fpgadataflow layers
+    # or form a contiguous dataflow block. This runs here (rather than later) so a
+    # failed conversion is reported clearly, before step_create_dataflow_partition
+    # (which assumes a single clean dataflow block) fails less obviously.
+    validation_result = model.analysis(validate_dataflow_conversion)
+    print(validation_result["message"])
+    if not validation_result["valid"]:
+        raise AssertionError(validation_result["message"])
 
     return model
 
@@ -581,12 +728,6 @@ def step_apply_folding_config(model: ModelWrapper, cfg: DataflowBuildConfig):
     else:
         print("No folding config json provided, skipping step_apply_folding_config.")
 
-    if VerificationStepType.FOLDED_HLS_CPPSIM in cfg._resolve_verification_steps():
-        # prepare cppsim
-        model = model.transform(PrepareCppSim(), apply_to_subgraphs=True)
-        model = model.transform(CompileCppSim(), apply_to_subgraphs=True)
-        model = model.transform(SetExecMode("cppsim"), apply_to_subgraphs=True)
-        verify_step(model, cfg, "folded_hls_cppsim", need_parent=True)
     return model
 
 
@@ -663,27 +804,71 @@ def step_generate_estimate_reports(model: ModelWrapper, cfg: DataflowBuildConfig
     return model
 
 
+def step_minimize_bit_width_datatype_only(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """First pass: datatype-based bit width minimization before specialization.
+
+    Always runs (ignores cfg.minimize_bit_width) because specialization needs
+    realistic bit widths for correct RTL/HLS decisions. Uses worst-case datatype
+    bounds, not actual values. See also: step_minimize_bit_width (second pass).
+    """
+    model = model.transform(MinimizeWeightBitWidth(datatype_only=True), apply_to_subgraphs=True)
+    model = model.transform(MinimizeAccumulatorWidth(datatype_only=True), apply_to_subgraphs=True)
+    model = model.transform(InferDataTypes(), apply_to_subgraphs=True)
+    return model
+
+
 def step_minimize_bit_width(model: ModelWrapper, cfg: DataflowBuildConfig):
-    """Tighten the weight and accumulator bit widths for each layer."""
+    """Second pass: bit width minimization after folding decisions.
+
+    Uses value-based minimization where safe, datatype-based otherwise (e.g.,
+    runtime_writeable_weights). Runs RoundAndClipThresholds and verification.
+    See also: step_minimize_bit_width_datatype_only (first pass).
+    """
     if cfg.minimize_bit_width:
         model = model.transform(MinimizeWeightBitWidth(), apply_to_subgraphs=True)
         model = model.transform(MinimizeAccumulatorWidth(), apply_to_subgraphs=True)
-        model = model.transform(RoundAndClipThresholds(), apply_to_subgraphs=True)
         # make sure the changed datatypes are propagated through the network
         model = model.transform(InferDataTypes(), apply_to_subgraphs=True)
     else:
-        print("minimize_bit_width set to False, skipping step_minimize_bit_width.")
+        print("minimize_bit_width set to False, only run RoundAndClipThresholds.")
+
+    # Always run RoundAndClipThresholds after accumulator widths are determined
+    model = model.transform(RoundAndClipThresholds(), apply_to_subgraphs=True)
+    model = model.transform(InferDataTypes(), apply_to_subgraphs=True)
+    # Run MinimizeWeightBitWidth again to minimize threshold datatypes after rounding/clipping
+    if cfg.minimize_bit_width:
+        model = model.transform(MinimizeWeightBitWidth(), apply_to_subgraphs=True)
+        model = model.transform(InferDataTypes(), apply_to_subgraphs=True)
+
+    if VerificationStepType.FOLDED_HLS_CPPSIM in cfg._resolve_verification_steps():
+        # prepare cppsim
+        model = model.transform(PrepareCppSim(), apply_to_subgraphs=True)
+        model = model.transform(CompileCppSim(), apply_to_subgraphs=True)
+        model = model.transform(SetExecMode("cppsim"), apply_to_subgraphs=True)
+        # Set iteration context path on FINNLoop nodes if verify_save_full_context is enabled
+        if cfg.verify_save_full_context:
+            verify_out_dir = cfg.output_dir + "/verification_output"
+            os.makedirs(verify_out_dir, exist_ok=True)
+            for loop_node in model.get_nodes_by_op_type("FINNLoop"):
+                loop_inst = getCustomOp(loop_node)
+                ctx_path = os.path.join(
+                    verify_out_dir, f"iteration_context_{loop_node.name}_folded_hls_cppsim.npz"
+                )
+                loop_inst.set_nodeattr("iteration_context_path", ctx_path)
+        verify_step(model, cfg, "folded_hls_cppsim", need_parent=True)
+        # Clear iteration_context_path after verification
+        if cfg.verify_save_full_context:
+            for loop_node in model.get_nodes_by_op_type("FINNLoop"):
+                loop_inst = getCustomOp(loop_node)
+                loop_inst.set_nodeattr("iteration_context_path", "")
+
     return model
 
 
 def step_hw_codegen(model: ModelWrapper, cfg: DataflowBuildConfig):
     """Generate Vitis HLS code to prepare HLSBackend nodes for IP generation.
     And fills RTL templates for RTLBackend nodes."""
-
     model = model.transform(GiveUniqueNodeNames())
-    loop_nodes = model.get_nodes_by_op_type("FINNLoop")
-    for node in loop_nodes:
-        prepare_loop_ops_fifo_sizing(node, cfg)
     model = model.transform(
         PrepareIP(cfg._resolve_fpga_part(), cfg._resolve_hls_clk_period()),
         apply_to_subgraphs=True,
@@ -695,10 +880,6 @@ def step_hw_codegen(model: ModelWrapper, cfg: DataflowBuildConfig):
 def step_hw_ipgen(model: ModelWrapper, cfg: DataflowBuildConfig):
     """Run Vitis HLS synthesis on generated code for HLSBackend nodes,
     in order to generate IP blocks. For RTL nodes this step does not do anything."""
-
-    loop_nodes = model.get_nodes_by_op_type("FINNLoop")
-    for node in loop_nodes:
-        prepare_loop_ops_ipgen(node, cfg)
     model = model.transform(HLSSynthIP(cfg._resolve_fpga_part()))
     model = model.transform(ReplaceVerilogRelPaths())
     report_dir = cfg.output_dir + "/report"
@@ -715,9 +896,41 @@ def step_hw_ipgen(model: ModelWrapper, cfg: DataflowBuildConfig):
             json.dump(estimate_layer_resources_hls, f, indent=2)
 
     if VerificationStepType.NODE_BY_NODE_RTLSIM in cfg._resolve_verification_steps():
-        model = model.transform(PrepareRTLSim())
-        model = model.transform(SetExecMode("rtlsim"))
-        verify_step(model, cfg, "node_by_node_rtlsim", need_parent=True)
+        # Check for HLS+RTL DSP conflict - only skip for MLO models
+        # (unrolled graphs work fine for node-by-node rtlsim)
+        skip_verification = False
+        if is_mlo(model):
+            verify_out_dir = cfg.output_dir + "/verification_output"
+            os.makedirs(verify_out_dir, exist_ok=True)
+            skip_verification = warn_hls_rtl_dsp_conflict(
+                model, "node_by_node_rtlsim", verify_out_dir
+            )
+            if skip_verification:
+                print(
+                    "NOTE: This model contains a FINNLoop which is treated as a closed IP "
+                    "during node-by-node rtlsim. The conflicting ops are inside the loop "
+                    "body and cannot be simulated individually."
+                )
+
+        if not skip_verification:
+            if cfg.verify_save_rtlsim_waveforms:
+                verify_out_dir = cfg.output_dir + "/verification_output"
+                waveform_dir = verify_out_dir + "/node_by_node_rtlsim_waveforms"
+                os.makedirs(waveform_dir, exist_ok=True)
+                abspath = os.path.abspath(waveform_dir)
+                # Set rtlsim_trace on each node BEFORE PrepareRTLSim so compilation uses debug=True
+                for node in model.graph.node:
+                    node_inst = getCustomOp(node)
+                    node_inst.set_nodeattr("rtlsim_trace", f"{abspath}/{node.name}_rtlsim.wdb")
+            model = model.transform(PrepareRTLSim(behav=cfg.verify_rtlsim_behavioral))
+            model = model.transform(SetExecMode("rtlsim"))
+            verify_step(model, cfg, "node_by_node_rtlsim", need_parent=True)
+            # Clear rtlsim_trace attributes to prevent later simulations from
+            # accidentally writing waveform files
+            if cfg.verify_save_rtlsim_waveforms:
+                for node in model.graph.node:
+                    node_inst = getCustomOp(node)
+                    node_inst.set_nodeattr("rtlsim_trace", "")
     return model
 
 
@@ -744,18 +957,47 @@ def step_set_fifo_depths(model: ModelWrapper, cfg: DataflowBuildConfig):
                 PrepareIP(cfg._resolve_fpga_part(), cfg._resolve_hls_clk_period())
             )
             model = model.transform(HLSSynthIP(cfg._resolve_fpga_part()))
+            if cfg.fifosim_save_waveform:
+                report_dir = cfg.output_dir + "/report"
+                os.makedirs(report_dir, exist_ok=True)
+                for node in model.graph.node:
+                    node_inst = getCustomOp(node)
+                    node_inst.set_nodeattr(
+                        "rtlsim_trace",
+                        os.path.abspath(report_dir) + f"/{node.name}_fifosim_trace.wdb",
+                    )
             model = model.transform(PrepareRTLSim(behav=True))
             model = model.transform(AnnotateCycles())
             period = model.analysis(dataflow_performance)["max_cycles"] + 10
             model = model.transform(DeriveCharacteristic(period))
+            if cfg.fifosim_save_waveform:
+                for node in model.graph.node:
+                    getCustomOp(node).set_nodeattr("rtlsim_trace", "")
             model = model.transform(DeriveFIFOSizes())
             model = model.transform(
                 InsertFIFO(
-                    vivado_ram_style=cfg.large_fifo_mem_style,
-                    max_qsrl_depth=256,
                     create_shallow_fifos=True,
                 )
             )
+            # Clean up characterization attributes after FIFO sizing. The
+            # io_chrc arrays are offloaded to sidecar .npy files referenced by
+            # the io_chrc_*_file attrs; unlink those files before dropping the
+            # attrs so we don't leak them.
+            for node in model.graph.node:
+                for file_attr_name in ["io_chrc_in_file", "io_chrc_out_file"]:
+                    attr = get_by_name(node.attribute, file_attr_name)
+                    if attr is not None:
+                        fname = attr.s.decode("utf-8")
+                        if fname != "" and os.path.isfile(fname):
+                            os.remove(fname)
+                for attr_name in [
+                    "io_chrc_period",
+                    "io_chrc_in_file",
+                    "io_chrc_out_file",
+                ]:
+                    attr = get_by_name(node.attribute, attr_name)
+                    if attr is not None:
+                        node.attribute.remove(attr)
             model = model.transform(SpecializeLayers(cfg._resolve_fpga_part()))
             model = model.transform(GiveUniqueNodeNames())
             model = model.transform(GiveReadableTensorNames())
@@ -771,11 +1013,12 @@ def step_set_fifo_depths(model: ModelWrapper, cfg: DataflowBuildConfig):
                     cfg._resolve_fpga_part(),
                     cfg._resolve_hls_clk_period(),
                     swg_exception=cfg.default_swg_exception,
-                    vivado_ram_style=cfg.large_fifo_mem_style,
                     fifosim_input_throttle=cfg.fifosim_input_throttle,
                     cfg_n_inferences=cfg.fifosim_n_inferences,
+                    debug_log_dir=(_fifo_debug_live_dir(cfg) if cfg.debug_fifo else None),
                 )
             )
+            snapshot_fifo_logs(cfg, "fifo_sizing")
             model = model.transform(GiveUniqueNodeNames())
             loop_nodes = model.get_nodes_by_op_type("FINNLoop")
             for loop_node in loop_nodes:
@@ -809,7 +1052,6 @@ def step_set_fifo_depths(model: ModelWrapper, cfg: DataflowBuildConfig):
         "parallel_window",
         "ram_style",
         "depth",
-        "impl_style",
         "resType",
         "mem_mode",
         "runtime_writeable_weights",
@@ -828,11 +1070,9 @@ def step_set_fifo_depths(model: ModelWrapper, cfg: DataflowBuildConfig):
     else:
         extract_model_config_to_json(model, cfg.output_dir + "/final_hw_config.json", hw_attrs)
 
-    # perform FIFO splitting and shallow FIFO removal only after the final config
-    # json file has been written. otherwise, since these transforms may add/remove
-    # FIFOs, we get name mismatch problems when trying to reuse the final config.
-    if cfg.split_large_fifos:
-        model = model.transform(SplitLargeFIFOs())
+    # perform shallow FIFO removal only after the final config json file has been
+    # written. otherwise, since this transform removes FIFOs, we get name mismatch
+    # problems when trying to reuse the final config.
     model = model.transform(RemoveShallowFIFOs())
 
     # after FIFOs are ready to go, call PrepareIP and HLSSynthIP again
@@ -842,27 +1082,41 @@ def step_set_fifo_depths(model: ModelWrapper, cfg: DataflowBuildConfig):
     return model
 
 
-def verify_mlo(model: ModelWrapper, cfg: DataflowBuildConfig, step: str):
-    finn_loop = model.get_nodes_by_op_type("FINNLoop")
-    # TODO: allow for multiple FINNLoops
-    mlo_prehook = mlo_prehook_func_factory(finn_loop[0])
-    verify_step(model, cfg, "stitched_ip_rtlsim", need_parent=False, rtlsim_pre_hook=mlo_prehook)
-
-
 def step_create_stitched_ip(model: ModelWrapper, cfg: DataflowBuildConfig):
     """Create stitched IP for a graph after all HLS IP blocks have been generated.
     Depends on the DataflowOutputType.STITCHED_IP output product."""
 
     if DataflowOutputType.STITCHED_IP in cfg.generate_outputs:
         stitched_ip_dir = cfg.output_dir + "/stitched_ip"
+        # If OOC_SYNTH is also requested, run P&R to extract metrics
+        run_pnr = DataflowOutputType.OOC_SYNTH in cfg.generate_outputs
         model = model.transform(
             CreateStitchedIP(
                 cfg._resolve_fpga_part(),
                 cfg.synth_clk_period_ns,
-                vitis=cfg.stitched_ip_gen_dcp,
+                run_synth=cfg.stitched_ip_gen_dcp or run_pnr,
+                run_pnr=run_pnr,
                 signature=cfg.signature,
             )
         )
+        # If P&R was run, parse the OOC results and store in model metadata + write report
+        if run_pnr:
+            vivado_stitch_proj = model.get_metadata_prop("vivado_stitch_proj")
+            ooc_res_dict = parse_ooc_synth_results(vivado_stitch_proj)
+            if ooc_res_dict is not None:
+                # Calculate estimated throughput from fmax and cycle analysis
+                estimate_network_performance = model.analysis(dataflow_performance)
+                n_clock_cycles_per_sec = float(ooc_res_dict["fmax_mhz"]) * (10**6)
+                est_fps = n_clock_cycles_per_sec / estimate_network_performance["max_cycles"]
+                ooc_res_dict["estimated_throughput_fps"] = est_fps
+
+                model.set_metadata_prop("res_total_ooc_synth", str(ooc_res_dict))
+                # Write results to report directory
+                report_dir = cfg.output_dir + "/report"
+                os.makedirs(report_dir, exist_ok=True)
+                with open(report_dir + "/ooc_synth_and_timing.json", "w") as f:
+                    json.dump(ooc_res_dict, f, indent=2)
+
         # TODO copy all ip sources into output dir? as zip?
         shutil.copytree(
             model.get_metadata_prop("vivado_stitch_proj"), stitched_ip_dir, dirs_exist_ok=True
@@ -875,27 +1129,87 @@ def step_create_stitched_ip(model: ModelWrapper, cfg: DataflowBuildConfig):
             skipping step_create_stitched_ip."""
         )
     if VerificationStepType.STITCHED_IP_RTLSIM in cfg._resolve_verification_steps():
-        # prepare ip-stitched rtlsim
-        verify_model = deepcopy(model)
-        verify_model = prepare_for_stitched_ip_rtlsim(verify_model, cfg)
-        # use critical path estimate to set rtlsim liveness threshold
-        # (very conservative)
-        verify_model = verify_model.transform(AnnotateCycles())
-        estimate_network_performance = verify_model.analysis(dataflow_performance)
-        prev_liveness = get_liveness_threshold_cycles()
-        os.environ["LIVENESS_THRESHOLD"] = str(
-            int(estimate_network_performance["critical_path_cycles"] * 1.1 + 50)
+        # Check for HLS+RTL DSP conflict before rtlsim
+        # (affects both MLO and unrolled graphs for stitched IP rtlsim)
+        verify_out_dir = cfg.output_dir + "/verification_output"
+        os.makedirs(verify_out_dir, exist_ok=True)
+        if not warn_hls_rtl_dsp_conflict(model, "stitched_ip_rtlsim", verify_out_dir):
+            # No conflict - proceed with verification
+            # prepare ip-stitched rtlsim
+            verify_model = deepcopy(model)
+            verify_model = prepare_for_stitched_ip_rtlsim(verify_model, cfg)
+            # use critical path estimate to set rtlsim liveness threshold
+            # (very conservative)
+            verify_model = verify_model.transform(AnnotateCycles())
+            estimate_network_performance = verify_model.analysis(dataflow_performance)
+            stitched_liveness_estimate = int(
+                estimate_network_performance["critical_path_cycles"] * 1.1 + 50
+            )
+            verify_model.set_metadata_prop(
+                "rtlsim_liveness_estimate", str(stitched_liveness_estimate)
+            )
+            if cfg.verify_save_rtlsim_waveforms:
+                verify_out_dir = cfg.output_dir + "/verification_output"
+                waveform_dir = verify_out_dir + "/stitched_ip_rtlsim_waveforms"
+                os.makedirs(waveform_dir, exist_ok=True)
+                abspath = os.path.abspath(waveform_dir)
+                verify_model.set_metadata_prop("rtlsim_trace", abspath + "/verify_rtlsim.wdb")
+            if cfg.verify_rtlsim_behavioral:
+                verify_model.set_metadata_prop("rtlsim_behavioral", "1")
+            # MLO and non-MLO both route through the parent (need_parent=True); the
+            # stitched child self-derives its FINNLoop memory-init pre-hook.
+            verify_step(
+                verify_model,
+                cfg,
+                "stitched_ip_rtlsim",
+                need_parent=True,
+            )
+            if is_mlo(model):
+                for loop_node in verify_model.get_nodes_by_op_type("FINNLoop"):
+                    snapshot_fifo_logs(cfg, "stitched_ip_rtlsim", loop_context=loop_node.name)
+            snapshot_fifo_logs(cfg, "stitched_ip_rtlsim")
+    return model
+
+
+def step_export_portable_rtl(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Export a self-contained, portable RTL project.
+
+    If STITCHED_IP was not requested, this step will run CreateStitchedIP
+    internally (without synthesis) to generate the wrapper and file lists
+    needed for the portable export.
+
+    The export contains:
+    - All Verilog/SystemVerilog source files with relative paths
+    - All .dat memory initialization files
+    - A filelist.f for simulator tools (Verilator, QuestaSim, ModelSim)
+    - A sources.tcl for Vivado non-IPI projects
+    """
+
+    if DataflowOutputType.PORTABLE_RTL in cfg.generate_outputs:
+        # If stitched IP wasn't created yet, run CreateStitchedIP to generate
+        # the wrapper and file lists (without synthesis)
+        vivado_stitch_proj = model.get_metadata_prop("vivado_stitch_proj")
+        if not vivado_stitch_proj:
+            print("Creating stitched IP for portable RTL export (synthesis disabled)...")
+            model = model.transform(
+                CreateStitchedIP(
+                    cfg._resolve_fpga_part(),
+                    cfg.synth_clk_period_ns,
+                    run_synth=False,
+                    run_pnr=False,
+                    signature=cfg.signature,
+                )
+            )
+
+        export_dir = cfg.output_dir + "/portable_rtl"
+        model = model.transform(ExportPortableRTL(export_dir))
+        print("Portable RTL export written to " + export_dir)
+    else:
+        print(
+            """DataflowOutputType.PORTABLE_RTL not in requested outputs,
+            skipping step_export_portable_rtl."""
         )
-        if cfg.verify_save_rtlsim_waveforms:
-            verify_out_dir = cfg.output_dir + "/verification_output"
-            os.makedirs(verify_out_dir, exist_ok=True)
-            abspath = os.path.abspath(verify_out_dir)
-            verify_model.set_metadata_prop("rtlsim_trace", abspath + "/verify_rtlsim.wdb")
-        if is_mlo(model):
-            verify_mlo(verify_model, cfg, "stitched_ip_rtlsim")
-        else:
-            verify_step(verify_model, cfg, "stitched_ip_rtlsim", need_parent=True)
-        os.environ["LIVENESS_THRESHOLD"] = str(prev_liveness)
+
     return model
 
 
@@ -925,31 +1239,17 @@ def step_measure_rtlsim_performance(model: ModelWrapper, cfg: DataflowBuildConfi
         perf = model.analysis(dataflow_performance)
         latency = perf["critical_path_cycles"]
         max_iters = latency * 1.1 + 50
-        rtlsim_perf_dict = xsi_fifosim(model, rtlsim_bs, max_iters=max_iters)
+        # Use behav=False for performance measurement to use real RTL components
+        # instead of behavioral models (FINN_SIMULATION affects FIFOs, MVU, LayerNorm,
+        # and RTL elementwise ops)
+        rtlsim_perf_dict = xsi_fifosim(model, rtlsim_bs, max_iters=max_iters, behav=False)
         # keep keys consistent between the Python and C++-styles
-        cycles = rtlsim_perf_dict["cycles"]
-        clk_ns = cfg.synth_clk_period_ns
-        fclk_mhz = 1 / (clk_ns * 0.001)
-        runtime_s = (cycles * clk_ns) * (10**-9)
-        rtlsim_perf_dict["runtime[ms]"] = runtime_s * 1000
-        rtlsim_perf_dict["throughput[images/s]"] = rtlsim_bs / runtime_s
-        rtlsim_perf_dict["fclk[mhz]"] = fclk_mhz
         for key, val in rtlsim_perf_dict.items():
             if "max_count" in key:
                 del rtlsim_perf_dict[key]
-        # estimate stable-state throughput based on latency+throughput
-        if rtlsim_bs == 1:
-            rtlsim_perf_dict["stable_throughput[images/s]"] = rtlsim_perf_dict[
-                "throughput[images/s]"
-            ]
-        else:
-            total_cycles = rtlsim_perf_dict["cycles"]
-            latency_cycles = rtlsim_perf_dict["latency_cycles"]
-            stablestate_cycles = total_cycles - latency_cycles
-            clk_ns = cfg.synth_clk_period_ns
-            fclk_mhz = 1 / (clk_ns * 0.001)
-            runtime_s = (stablestate_cycles * clk_ns) * (10**-9)
-            rtlsim_perf_dict["stable_throughput[images/s]"] = rtlsim_bs / runtime_s
+        rtlsim_perf_dict = annotate_rtlsim_performance(
+            rtlsim_perf_dict, rtlsim_bs, cfg.synth_clk_period_ns
+        )
 
         with open(report_dir + "/rtlsim_performance.json", "w") as f:
             json.dump(rtlsim_perf_dict, f, indent=2)
@@ -999,35 +1299,6 @@ def step_make_driver(model: ModelWrapper, cfg: DataflowBuildConfig):
     return model
 
 
-def step_out_of_context_synthesis(model: ModelWrapper, cfg: DataflowBuildConfig):
-    """Run out-of-context synthesis and generate reports.
-    Depends on the DataflowOutputType.STITCHED_IP output product."""
-    if DataflowOutputType.OOC_SYNTH in cfg.generate_outputs:
-        assert DataflowOutputType.STITCHED_IP in cfg.generate_outputs, "OOC needs stitched IP"
-        model = model.transform(
-            SynthOutOfContext(part=cfg._resolve_fpga_part(), clk_period_ns=cfg.synth_clk_period_ns)
-        )
-        report_dir = cfg.output_dir + "/report"
-        os.makedirs(report_dir, exist_ok=True)
-        ooc_res_dict = model.get_metadata_prop("res_total_ooc_synth")
-        ooc_res_dict = eval(ooc_res_dict)
-
-        estimate_network_performance = model.analysis(dataflow_performance)
-        # add some more metrics to estimated performance
-        n_clock_cycles_per_sec = float(ooc_res_dict["fmax_mhz"]) * (10**6)
-        est_fps = n_clock_cycles_per_sec / estimate_network_performance["max_cycles"]
-        ooc_res_dict["estimated_throughput_fps"] = est_fps
-        with open(report_dir + "/ooc_synth_and_timing.json", "w") as f:
-            json.dump(ooc_res_dict, f, indent=2)
-
-    else:
-        print(
-            """DataflowOutputType.OOC_SYNTH not in requested outputs,
-            skipping step_out_of_context_synthesis."""
-        )
-    return model
-
-
 def step_synthesize_bitfile(model: ModelWrapper, cfg: DataflowBuildConfig):
     """Synthesize a bitfile for the using the specified shell flow, using either
     Vivado or Vitis, to target the specified board."""
@@ -1067,14 +1338,20 @@ def step_synthesize_bitfile(model: ModelWrapper, cfg: DataflowBuildConfig):
 
         elif cfg.shell_flow_type == ShellFlowType.VITIS_ALVEO:
             model = model.transform(
-                VitisBuild(
+                PrepareForLinking(
                     cfg._resolve_fpga_part(),
                     cfg.synth_clk_period_ns,
-                    cfg._resolve_vitis_platform(),
-                    strategy=cfg._resolve_vitis_opt_strategy(),
-                    enable_debug=cfg.enable_hw_debug,
+                    "vitis-xrt",
                     floorplan_file=cfg.vitis_floorplan_file,
                     partition_model_dir=partition_model_dir,
+                )
+            )
+            model = model.transform(
+                VitisLink(
+                    cfg._resolve_vitis_platform(),
+                    cfg.synth_clk_period_ns,
+                    strategy=cfg._resolve_vitis_opt_strategy(),
+                    enable_debug=cfg.enable_hw_debug,
                 )
             )
             copy(model.get_metadata_prop("bitfile"), bitfile_dir + "/finn-accel.xclbin")
@@ -1086,6 +1363,17 @@ def step_synthesize_bitfile(model: ModelWrapper, cfg: DataflowBuildConfig):
             post_synth_resources = model.analysis(post_synth_res)
             with open(report_dir + "/post_synth_resources.json", "w") as f:
                 json.dump(post_synth_resources, f, indent=2)
+        elif cfg.shell_flow_type == ShellFlowType.SLASH_ALVEO:
+            model = model.transform(
+                PrepareForLinking(cfg._resolve_fpga_part(), cfg.synth_clk_period_ns, "slash-vrt")
+            )
+            model = model.transform(SlashLink(not cfg.enable_hw_sim))
+            copy(model.get_metadata_prop("bitfile"), bitfile_dir + "/finn-accel.vbin")
+            if not cfg.enable_hw_sim:
+                copy(model.get_metadata_prop("slash_report"), bitfile_dir + "/slash_report.xml")
+                post_synth_resources = model.analysis(post_synth_res)
+                with open(report_dir + "/post_synth_resources.json", "w") as f:
+                    json.dump(post_synth_resources, f, indent=2)
         else:
             raise Exception("Unrecognized shell_flow_type: " + str(cfg.shell_flow_type))
         print("Bitfile written into " + bitfile_dir)
@@ -1140,13 +1428,127 @@ def step_loop_rolling(model, cfg):
             )
         if cfg.loop_body_hierarchy is not None:
             print(f"Running Loop Rolling on {cfg.loop_body_hierarchy} hierarchy")
-            loop_extraction = LoopExtraction(cfg.loop_body_hierarchy)
+            template_path = os.path.join(cfg.output_dir, "loop-body-template.onnx")
+            loop_extraction = LoopExtraction(cfg.loop_body_hierarchy, template_path)
             model = model.transform(loop_extraction)
             model = model.transform(LoopRolling(loop_extraction.loop_body_template))
-            move("loop-body-template.onnx", cfg.output_dir + "/loop-body-template.onnx")
     else:
         print("MLO not selected, skipping step_loop_rolling.")
 
+    return model
+
+
+def step_loop_body_set_fifo_depths(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Set FIFO depths for loop body model.
+
+    This step is designed to be called on a loop body model (extracted from FINNLoop).
+    It performs PrepareIP, HLSSynthIP, and InsertAndSetFIFODepths with parameters
+    appropriate for loop bodies.
+
+    The enclosing FINNLoop name is read from the "loop_context" metadata prop
+    (set by _apply_to_loop_bodies) and used to tag debug_fifo logs / waveforms so
+    that per-loop-body FIFO sizing can be told apart.
+
+    Args:
+        model: Loop body ModelWrapper
+        cfg: Build configuration
+
+    Returns:
+        Loop body ModelWrapper with FIFOs sized
+    """
+    loop_context = model.get_metadata_prop("loop_context")
+    # Prepare and synthesize IP for FIFO characterization
+    model = model.transform(PrepareIP(cfg._resolve_fpga_part(), cfg._resolve_hls_clk_period()))
+    model = model.transform(HLSSynthIP(cfg._resolve_hls_clk_period()))
+    model = model.transform(ReplaceVerilogRelPaths())
+
+    # Set waveform trace if configured
+    if cfg.fifosim_save_waveform:
+        report_dir = cfg.output_dir + "/report"
+        os.makedirs(report_dir, exist_ok=True)
+        trace_name = (loop_context or "loop_body") + "_fifosim_trace.wdb"
+        model.set_metadata_prop("rtlsim_trace", os.path.abspath(report_dir) + "/" + trace_name)
+
+    # Insert and size FIFOs
+    model = model.transform(
+        InsertAndSetFIFODepths(
+            cfg._resolve_fpga_part(),
+            cfg._resolve_hls_clk_period(),
+            swg_exception=cfg.default_swg_exception,
+            fifosim_input_throttle=cfg.fifosim_input_throttle,
+            debug_log_dir=(_fifo_debug_live_dir(cfg) if cfg.debug_fifo else None),
+            debug_log_prefix=(loop_context + "_") if loop_context else "",
+        )
+    )
+    # snapshot per-FIFO debug logs for this loop body before the live dir is reused
+    snapshot_fifo_logs(cfg, "fifo_sizing", loop_context=loop_context)
+    model = model.transform(RemoveShallowFIFOs())
+    # Re-apply the enclosing FINNLoop name as a prefix so loop-body node (and
+    # hence IP/module) names stay unique across the whole design. Without this
+    # the loop body's stitched IP uses generic names that collide with the main
+    # graph's nodes at top-level stitching, elaborating as a black box (X output).
+    model = model.transform(
+        GiveUniqueNodeNames(prefix=(loop_context + "_") if loop_context else "")
+    )
+    model = model.transform(GiveReadableTensorNames())
+
+    return model
+
+
+def step_loop_body_ipgen_and_stitch(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """Run HLS synthesis and create stitched IP for loop body model.
+
+    This step is designed to be called on a loop body model (extracted from FINNLoop).
+    It performs HLSSynthIP and CreateStitchedIP with parameters appropriate for
+    loop bodies (no verification, no output directory operations).
+
+    Args:
+        model: Loop body ModelWrapper
+        cfg: Build configuration
+
+    Returns:
+        Loop body ModelWrapper with synthesized IP and stitched IP created
+    """
+    # HLS synthesis for this loop body
+    model = model.transform(HLSSynthIP(cfg._resolve_hls_clk_period()))
+
+    # Create stitched IP for this loop body
+    model = model.transform(
+        CreateStitchedIP(
+            cfg._resolve_fpga_part(),
+            cfg.synth_clk_period_ns,
+        )
+    )
+
+    return model
+
+
+def step_assign_ddr_weight_offsets(model: ModelWrapper, cfg: DataflowBuildConfig):
+    """MLO only: assign DDR address offsets for streamed weights.
+
+    Must run before step_hw_codegen, because PrepareIP bakes the assigned
+    address_offset into the generated RTL, and after folding/bit-width
+    minimization, because the offsets depend on the final weight layout.
+    No-op unless MLO is enabled. AssignMemoryOffset itself skips any FINNLoop
+    node whose mem_type attribute is not "DDR".
+
+    Any FINNLoop whose mem_type is still unset is resolved here
+    """
+    if cfg.mlo:
+        resolved_mem_type = cfg._resolve_mem_type()
+        for node in model.get_nodes_by_op_type("FINNLoop"):
+            node_inst = getCustomOp(node)
+            if node_inst.get_nodeattr("mem_type") == "":
+                node_inst.set_nodeattr("mem_type", resolved_mem_type)
+                if resolved_mem_type == "HBM":
+                    print(
+                        "NOTE: selecting HBM mem_type for FINNLoop '%s' on board %s. "
+                        "You can create a stitched IP to use with HBM, but there is "
+                        "currently no automatic system integration for HBM as there is "
+                        "for boards with DDR. Set mem_type in the folding config to "
+                        "override." % (node.name, cfg.board)
+                    )
+        model = model.transform(AssignMemoryOffset())
     return model
 
 
@@ -1167,10 +1569,13 @@ build_dataflow_step_lookup = {
     "step_hw_ipgen": step_hw_ipgen,
     "step_set_fifo_depths": step_set_fifo_depths,
     "step_create_stitched_ip": step_create_stitched_ip,
+    "step_export_portable_rtl": step_export_portable_rtl,
     "step_measure_rtlsim_performance": step_measure_rtlsim_performance,
     "step_make_driver": step_make_driver,
-    "step_out_of_context_synthesis": step_out_of_context_synthesis,
     "step_synthesize_bitfile": step_synthesize_bitfile,
     "step_deployment_package": step_deployment_package,
     "step_loop_rolling": step_loop_rolling,
+    "step_loop_body_set_fifo_depths": step_loop_body_set_fifo_depths,
+    "step_loop_body_ipgen_and_stitch": step_loop_body_ipgen_and_stitch,
+    "step_assign_ddr_weight_offsets": step_assign_ddr_weight_offsets,
 }

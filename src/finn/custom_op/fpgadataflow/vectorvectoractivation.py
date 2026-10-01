@@ -296,7 +296,7 @@ class VVAU(HWCustomOp):
             pe = self.get_nodeattr("PE")
             return ch // pe
 
-    def uram_estimation(self):
+    def uram_estimation(self, fpgapart):
         P = self.get_nodeattr("PE")
         Q = self.get_nodeattr("SIMD")
         wdt = self.get_input_datatype(1)
@@ -315,7 +315,7 @@ class VVAU(HWCustomOp):
         depth_multiplier = math.ceil(omega / 4096)
         return width_multiplier * depth_multiplier
 
-    def bram_estimation(self):
+    def bram_estimation(self, fpgapart):
         """Calculates resource estimation for BRAM"""
         # TODO add in/out FIFO contributions
         P = self.get_nodeattr("PE")
@@ -350,26 +350,29 @@ class VVAU(HWCustomOp):
         else:
             return (math.ceil(omega / 512)) * (math.ceil(mem_width / 32))
 
-    def bram_efficiency_estimation(self):
+    def bram_efficiency_estimation(self, fpgapart):
         P = self.get_nodeattr("PE")
         wdt = self.get_input_datatype(1)
         W = wdt.bitwidth()
         omega = self.calc_wmem()
-        bram16_est = self.bram_estimation()
+        bram16_est = self.bram_estimation(fpgapart)
         if bram16_est == 0:
             return 1
         wbits = W * P * omega
         bram16_est_capacity = bram16_est * 36 * 512
         return wbits / bram16_est_capacity
 
-    def uram_efficiency_estimation(self):
+    def uram_efficiency_estimation(self, fpgapart):
         """Function for URAM efficiency estimation: actual parameter storage
-        needed divided by the allocated URAM storage (from estimation)"""
+        needed divided by the allocated URAM storage (from estimation)."""
+        # TODO: Versal URAM supports flexible bit widths (9/18/36/72) unlike
+        # UltraScale+ which only supports 72-bit. This could improve efficiency
+        # for narrow data types on Versal devices.
         wdt = self.get_input_datatype(1)
         W = wdt.bitwidth()
         D_in = int(np.prod(self.get_nodeattr("Kernel")))
         D_out = self.get_nodeattr("Channels")
-        uram_est = self.uram_estimation()
+        uram_est = self.uram_estimation(fpgapart)
         if uram_est == 0:
             return 1
         wbits = W * D_in * D_out
@@ -389,9 +392,15 @@ class VVAU(HWCustomOp):
         exp_cycles = ((ch * k_h * k_w) / pe / simd) * batch_size * (dim_h * dim_w) / mmv
         return int(exp_cycles)
 
-    def minimize_accumulator_width(self, model):
+    def minimize_accumulator_width(self, model, datatype_only=False):
         """Minimize the accumulator bit width according to the weight values,
-        input data types, and size of dot product"""
+        input data types, and size of dot product.
+
+        Parameters
+        ----------
+        datatype_only : bool
+            If True, use worst-case datatype bounds instead of actual weight values.
+        """
         weights = model.get_initializer(self.onnx_node.input[1])
         k_h, k_w = self.get_nodeattr("Kernel")
         fm = self.get_nodeattr("Channels")
@@ -401,16 +410,14 @@ class VVAU(HWCustomOp):
         # for the bipolar case they need to be converted to bipolar
         if self.get_nodeattr("binaryXnorMode"):
             weights = 2 * weights - 1
-        if len(self.onnx_node.input) > 2:
-            thresholds = model.get_initializer(self.onnx_node.input[2])
-        else:
-            thresholds = None
+
         idt = self.get_input_datatype(0)
 
-        # if runtime-writeable weights or mem_mode=external, then the values of the weights can
-        # change and we need to use the worst-case values from the datatypes
+        # if datatype_only, runtime-writeable weights, or mem_mode=external,
+        # then we use worst-case values from the datatypes
         if (
-            self.get_nodeattr("runtime_writeable_weights")
+            datatype_only
+            or self.get_nodeattr("runtime_writeable_weights")
             or self.get_nodeattr("mem_mode") == "external"
         ):
             wdt = self.get_input_datatype(1)
@@ -422,24 +429,6 @@ class VVAU(HWCustomOp):
             acc_max = max(max(lower_range), max(upper_range))
         else:
             (acc_min, acc_max) = calculate_matvec_accumulator_range(weights, idt)
-
-        # if the thresholds can be used to determine range, then adjust the range
-        # according to the known values of the thresholds
-        if thresholds is not None:
-            threshold_tensor = self.get_hw_compatible_threshold_tensor(thresholds)
-            # set threshold datatype (and accumulator datatype implicitly)
-            min_threshold = thresholds.min()
-            max_threshold = thresholds.max()
-            # clip threshold values
-            if max_threshold > acc_max or min_threshold < acc_min:
-                warnings.warn("Clipping some thresholds in %s" % self.onnx_node.name)
-                thresholds = np.clip(thresholds, acc_min, acc_max)
-                model.set_initializer(self.onnx_node.input[2], thresholds)
-                threshold_tensor = self.get_hw_compatible_threshold_tensor(thresholds)
-                min_threshold = thresholds.min()
-                max_threshold = thresholds.max()
-            acc_min = min(min_threshold, acc_min)
-            acc_max = max(max_threshold, acc_max)
 
         # if the acc_range is always greater than 0, then acc_max <= 2^P - 1
         if acc_min >= 0:
@@ -454,14 +443,8 @@ class VVAU(HWCustomOp):
             acc_bit_width = math.ceil(acc_bit_width)
             adt = DataType[f"INT{acc_bit_width}"]
 
-        # if activation, assert that the thresholds can be expressed with adt
-        if thresholds is not None:
-            assert np.vectorize(adt.allowed)(
-                threshold_tensor
-            ).all(), "Thresholds in %s can't be expressed with type %s" % (
-                self.onnx_node.name,
-                str(adt),
-            )
+        # Note: Thresholds may not fit in the accumulator datatype at this point.
+        # They will be clipped to the accumulator range by RoundAndClipThresholds transformation.
 
         # if no activation, output and accumulator datatypes are the same
         if self.get_nodeattr("noActivation"):
@@ -477,8 +460,17 @@ class VVAU(HWCustomOp):
 
         return DataType[self.get_nodeattr("accDataType")]
 
-    def minimize_weight_bit_width(self, model):
-        """Minimize the bit width based on the values of the weights"""
+    def minimize_weight_bit_width(self, model, datatype_only=False):
+        """Minimize the bit width based on the values of the weights.
+
+        Parameters
+        ----------
+        datatype_only : bool
+            If True, skip value-based minimization.
+        """
+        if datatype_only:
+            return DataType[self.get_nodeattr("weightDataType")]
+
         if not (
             self.get_nodeattr("runtime_writeable_weights")
             or self.get_nodeattr("mem_mode") == "external"
@@ -494,6 +486,7 @@ class VVAU(HWCustomOp):
             else:
                 wdt = DataType.get_smallest_possible(w_max)
             self.set_nodeattr("weightDataType", wdt.name)
+
         return DataType[self.get_nodeattr("weightDataType")]
 
     def get_hw_compatible_threshold_tensor(self, orig_thres_matrix):
@@ -727,8 +720,8 @@ class VVAU(HWCustomOp):
                 bin_xnor_mode = self.get_nodeattr("binaryXnorMode") == 1
                 inp_is_bipolar = inp_is_bipolar or (inp_is_binary and bin_xnor_mode)
                 wt_is_bipolar = wt_is_bipolar or (wt_is_binary and bin_xnor_mode)
-                # get computed threshold datatype from attribute
-                tdt = DataType[self.get_nodeattr("accDataType")]
+                # get computed threshold datatype from tensor
+                tdt = model.get_tensor_datatype(self.onnx_node.input[2])
 
                 assert np.vectorize(tdt.allowed)(
                     threshold_tensor
@@ -814,8 +807,7 @@ class VVAU(HWCustomOp):
         return intf_names
 
     def code_generation_ipi(self):
-        source_target = "./ip/verilog/rtl_ops/%s" % self.onnx_node.name
-        cmd = ["file mkdir %s" % source_target]
+        cmd = []
         # add streamer if needed
         mem_mode = self.get_nodeattr("mem_mode")
         if mem_mode == "internal_decoupled":
@@ -857,7 +849,7 @@ class VVAU(HWCustomOp):
                 ms_rtllib_dir + "memstream.sv",
             ]
             for f in sourcefiles:
-                cmd += ["add_files -copy_to %s -norecurse %s" % (source_target, f)]
+                cmd += ["add_files -norecurse %s" % f]
             strm_inst = node_name + "_wstrm"
             cmd.append(
                 "create_bd_cell -type hier -reference %s /%s/%s"

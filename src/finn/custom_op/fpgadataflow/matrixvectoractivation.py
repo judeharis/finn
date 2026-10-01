@@ -35,11 +35,13 @@ from qonnx.core.datatype import DataType
 from qonnx.custom_op.general.multithreshold import multithreshold
 from qonnx.util.basic import (
     calculate_matvec_accumulator_range,
+    get_by_name,
     interleave_matrix_outer_dim_from_partitions,
     roundup_to_integer_multiple,
 )
 
 from finn.custom_op.fpgadataflow.hwcustomop import HWCustomOp
+from finn.util.basic import fifo_rtl_files, is_versal
 from finn.util.data_packing import numpy_to_hls_code, pack_innermost_dim_as_hex_string
 
 # ONNX i/o tensor shape assumptions for MatrixVectorActivation:
@@ -88,7 +90,7 @@ class MVAU(HWCustomOp):
                 "s",
                 False,
                 "internal_decoupled",
-                {"internal_embedded", "internal_decoupled", "external"},
+                {"internal_embedded", "internal_decoupled", "external", "external_mem", "dynamic"},
             ),
             # FPGA resource type for memories in internal_decoupled mode
             # auto -- let Vivado decide
@@ -123,8 +125,9 @@ class MVAU(HWCustomOp):
             # weight data from the weight FIFOs.
             "runtime_writeable_weights": ("i", False, 0, {0, 1}),
             "pumpedMemory": ("i", False, 0, {0, 1}),
-            # dynamic input
-            "dynamic_input": ("i", False, 0, {0, 1}),
+            # tiling height; only relevant for the RTL backend (MVAU_rtl), the
+            # HLS backend supports the untiled case (TH=1) only.
+            "TH": ("i", False, 1),
         }
         my_attrs.update(super().get_nodeattr_types())
         return my_attrs
@@ -258,21 +261,19 @@ class MVAU(HWCustomOp):
             i_bits = self.get_input_datatype(0).bitwidth()
             width = i_bits * self.get_nodeattr("SIMD")
         elif ind == 1:
-            if self.get_nodeattr("dynamic_input"):
-                width = (
-                    self.get_folded_input_shape(ind)[-1] * self.get_input_datatype(ind).bitwidth()
-                )
-            elif (
-                self.get_nodeattr("mem_mode") == "internal_decoupled"
-                or self.get_nodeattr("mem_mode") == "external"
-                or self.get_nodeattr("mlo_max_iter")
-            ):
-                pe = self.get_nodeattr("PE")
-                simd = self.get_nodeattr("SIMD")
-                wp = self.get_input_datatype(1).bitwidth()
-                width = pe * simd * wp
-            else:
-                width = 0
+            pe = self.get_nodeattr("PE")
+            simd = self.get_nodeattr("SIMD")
+            wp = self.get_input_datatype(1).bitwidth()
+            mem_mode = self.get_nodeattr("mem_mode")
+            theight = self.get_nodeattr("TH")
+
+            match mem_mode:
+                case "dynamic":
+                    width = pe * wp
+                case "external" | "external_mem" | "internal_decoupled":
+                    width = ((pe * simd) * wp) // theight
+                case _:
+                    width = 0
         elif ind == 2:
             # check if integrated thresholding and return 0
             # because threshold values are always embedded
@@ -297,22 +298,26 @@ class MVAU(HWCustomOp):
         mh = self.get_nodeattr("MH")
         simd = self.get_nodeattr("SIMD")
         pe = self.get_nodeattr("PE")
+        mem_mode = self.get_nodeattr("mem_mode")
         sf = mw // simd
         nf = mh // pe
         vecs = list(self.get_nodeattr("numInputVectors"))
+        n_vecs = int(np.prod(vecs))
+        theight = self.get_nodeattr("TH")
 
         if ind == 0:
             # calculate shape of input 0
             folded_input_shape = tuple(vecs + [sf, simd])
         elif ind == 1:
-            if self.get_nodeattr("dynamic_input"):
-                # calculate shape of input 1 (weights dynamic)
-                folded_input_shape = tuple(vecs[:2] + [mw] + [nf, pe])
-            elif self.get_nodeattr("mem_mode") == "external" or self.get_nodeattr("mlo_max_iter"):
-                # calculate shape of input 1 (weights)
-                folded_input_shape = tuple(vecs + [sf * nf, simd * pe])
-            else:
-                raise Exception("Undefined input shape for requested input")
+            match mem_mode:
+                case "dynamic":
+                    folded_input_shape = tuple(vecs[:2] + [mw] + [nf, pe])
+                case "external" | "external_mem" | "internal_decoupled":
+                    folded_input_shape = (n_vecs, sf * nf, (simd * pe) // theight)
+                case _:
+                    raise Exception("Undefined input shape for requested input")
+        else:
+            raise Exception("Undefined input shape for requested input")
 
         return folded_input_shape
 
@@ -362,7 +367,7 @@ class MVAU(HWCustomOp):
             pe = self.get_nodeattr("PE")
             return mh // pe
 
-    def uram_estimation(self):
+    def uram_estimation(self, fpgapart):
         P = self.get_nodeattr("PE")
         Q = self.get_nodeattr("SIMD")
         wdt = self.get_input_datatype(1)
@@ -377,14 +382,14 @@ class MVAU(HWCustomOp):
             (mmode == "internal_decoupled" and mstyle != "ultra")
             or (mmode == "internal_embedded" and self.calc_wmem() <= 128)
             or (mmode == "external")
-            or self.get_nodeattr("mlo_max_iter")
+            or (mmode == "external_mem")
         ):
             return 0
         width_multiplier = math.ceil(mem_width / 72)
         depth_multiplier = math.ceil(omega / 4096)
         return width_multiplier * depth_multiplier
 
-    def bram_estimation(self):
+    def bram_estimation(self, fpgapart):
         """Calculates resource estimation for BRAM based on:
         - FINN-R: An End-to-End Deep-Learning Framework for Fast
         Exploration of Quantized Neural Networks
@@ -407,7 +412,7 @@ class MVAU(HWCustomOp):
             (mmode == "internal_decoupled" and mstyle in ["distributed", "ultra"])
             or (mmode == "internal_embedded" and self.calc_wmem() <= 128)
             or (mmode == "external")
-            or self.get_nodeattr("mlo_max_iter")
+            or (mmode == "external_mem")
         ):
             return 0
         # assuming SDP mode RAMB18s (see UG573 Table 1-10)
@@ -426,65 +431,100 @@ class MVAU(HWCustomOp):
         else:
             return (math.ceil(omega / 512)) * (math.ceil(mem_width / 36))
 
-    def bram_efficiency_estimation(self):
+    def bram_efficiency_estimation(self, fpgapart):
         wdt = self.get_input_datatype(1)
         W = wdt.bitwidth()
         D_in = self.get_nodeattr("MW")
         D_out = self.get_nodeattr("MH")
-        bram16_est = self.bram_estimation()
+        bram16_est = self.bram_estimation(fpgapart)
         if bram16_est == 0:
             return 1
         wbits = W * D_in * D_out
         bram16_est_capacity = bram16_est * 36 * 512
         return wbits / bram16_est_capacity
 
-    def uram_efficiency_estimation(self):
+    def uram_efficiency_estimation(self, fpgapart):
         """Function for URAM efficiency estimation: actual parameter storage
-        needed divided by the allocated URAM storage (from estimation)"""
+        needed divided by the allocated URAM storage (from estimation)."""
+        # TODO: Versal URAM supports flexible bit widths (9/18/36/72) unlike
+        # UltraScale+ which only supports 72-bit. This could improve efficiency
+        # for narrow data types on Versal devices.
         wdt = self.get_input_datatype(1)
         W = wdt.bitwidth()
         D_in = self.get_nodeattr("MW")
         D_out = self.get_nodeattr("MH")
-        uram_est = self.uram_estimation()
+        uram_est = self.uram_estimation(fpgapart)
         if uram_est == 0:
             return 1
         wbits = W * D_in * D_out
         uram_est_capacity = uram_est * 72 * 4096
         return wbits / uram_est_capacity
 
+    def adapt_for_loop_body(self, input_types):
+        """
+        Adapt the MVAU for loop body execution.
+
+        When the weight tensor (input[1]) is indexed per iteration (PARAMETER
+        type), the weights must be streamed from external memory over the
+        AXI-MM interface. That path only exists in the RTL backend
+        (MVAU_rtl overrides this method to set mem_mode "external_mem").
+        The abstract HW op and the HLS backend cannot stream loop weights, so
+        reaching this base implementation with a streamed weight input is an
+        error: the node must be specialized to MVAU_rtl before loop rolling.
+
+        LoopRolling flags nodes with a per-iteration indexed weight by setting
+        mlo_max_iter (on the consumer of each PARAMETER loop input), so key off
+        that per-node signal rather than the positional loop signature.
+
+        NOTE: LoopRolling swallows KeyError/AttributeError from this hook, so
+        this deliberately raises a plain Exception to surface loudly.
+        """
+        if self.get_nodeattr("mlo_max_iter") > 0:
+            raise Exception(
+                "MLO weight streaming requires the RTL MVAU backend. "
+                "Specialize this MVAU to MVAU_rtl before loop rolling; "
+                "the HLS/abstract MVAU cannot stream per-iteration weights "
+                "over AXI-MM."
+            )
+
     def get_exp_cycles(self):
         pe = self.get_nodeattr("PE")
         simd = self.get_nodeattr("SIMD")
+        th = self.get_nodeattr("TH")
         num_inp_vec = self.get_nodeattr("numInputVectors")
         mh = self.get_nodeattr("MH")
         mw = self.get_nodeattr("MW")
         # since mmv != 1 is not supported yet, we set mmv for now to 1
         mmv = 1
-        exp_cycles = (mh / pe) * (mw / simd) * np.prod(num_inp_vec) / mmv
+        # Tiling/systolic reduces throughput
+        # TH>1 (tiling) reduces throughput by factor TH (tinner = PE*SIMD/TH)
+        exp_cycles = (mh / pe) * (mw / simd) * np.prod(num_inp_vec) * th / mmv
         return int(exp_cycles)
 
-    def minimize_accumulator_width(self, model):
+    def minimize_accumulator_width(self, model, datatype_only=False):
         """Minimize the accumulator bit width according to the weight values,
-        input data types, and size of dot product"""
+        input data types, and size of dot product.
+
+        Parameters
+        ----------
+        datatype_only : bool
+            If True, use worst-case datatype bounds instead of actual weight values.
+        """
         weights = model.get_initializer(self.onnx_node.input[1])
         # since in the calculation the values of the weight matrix are used,
         # for the bipolar case they need to be converted to bipolar
         if self.get_nodeattr("binaryXnorMode"):
             weights = 2 * weights - 1
 
-        thresholds = None
-        if len(self.onnx_node.input) > 2:
-            thresholds = model.get_initializer(self.onnx_node.input[2])
-
         idt = self.get_input_datatype(0)
 
-        # if runtime-writeable weights or mem_mode=external, then the values of the weights can
-        # change and we need to use the worst-case values from the datatypes
+        # if datatype_only, runtime-writeable weights, mem_mode=external, or
+        # weights are absent (MLO), then we use worst-case values from datatypes
         if (
-            self.get_nodeattr("runtime_writeable_weights")
-            or self.get_nodeattr("mem_mode") == "external"
-            or self.get_nodeattr("mlo_max_iter")
-            or self.get_nodeattr("dynamic_input")
+            datatype_only
+            or self.get_nodeattr("runtime_writeable_weights")
+            or self.get_nodeattr("mem_mode") in ["external", "external_mem", "dynamic"]
+            or weights is None
         ):
             mw = self.get_nodeattr("MW")
             mh = self.get_nodeattr("MH")
@@ -497,28 +537,6 @@ class MVAU(HWCustomOp):
             acc_max = max(max(lower_range), max(upper_range))
         else:
             (acc_min, acc_max) = calculate_matvec_accumulator_range(weights, idt)
-
-        # if the thresholds can be used to determine range, then adjust the range
-        # according to the known values of the thresholds
-        if thresholds is not None:
-            # Assume that thresholds values are integers from RoundAndClipThresholds
-            # during streamlining
-            threshold_tensor = self.get_hw_compatible_threshold_tensor(thresholds)
-            # Use double precision for threshold comparisons to prevent overflow
-            min_threshold = np.float64(thresholds.min())
-            max_threshold = np.float64(thresholds.max())
-            acc_min_fp = np.float64(acc_min)
-            acc_max_fp = np.float64(acc_max)
-            # clip threshold values
-            if max_threshold > acc_max_fp or min_threshold < acc_min_fp:
-                warnings.warn("Clipping some thresholds in %s" % self.onnx_node.name)
-                thresholds = np.clip(thresholds, acc_min, acc_max)
-                model.set_initializer(self.onnx_node.input[2], thresholds)
-                threshold_tensor = self.get_hw_compatible_threshold_tensor(thresholds)
-                min_threshold = np.float64(thresholds.min())
-                max_threshold = np.float64(thresholds.max())
-            acc_min = min(min_threshold, acc_min_fp)
-            acc_max = max(max_threshold, acc_max_fp)
 
         # if the acc_range is always greater than 0, then acc_max <= 2^P - 1
         if acc_min >= 0:
@@ -533,14 +551,8 @@ class MVAU(HWCustomOp):
             acc_bit_width = math.ceil(acc_bit_width)
             adt = DataType[f"INT{acc_bit_width}"]
 
-        # if activation, assert that the thresholds can be expressed with adt
-        if thresholds is not None:
-            assert np.vectorize(adt.allowed)(
-                threshold_tensor
-            ).all(), "Thresholds in %s can't be expressed with type %s" % (
-                self.onnx_node.name,
-                str(adt),
-            )
+        # Note: Thresholds may not fit in the accumulator datatype at this point.
+        # They will be clipped to the accumulator range by RoundAndClipThresholds transformation.
 
         # if no activation, output and accumulator datatypes are the same
         if self.get_nodeattr("noActivation"):
@@ -555,15 +567,24 @@ class MVAU(HWCustomOp):
         self.set_nodeattr("accDataType", adt.name)
         return DataType[self.get_nodeattr("accDataType")]
 
-    def minimize_weight_bit_width(self, model):
-        """Minimize the bit width based on the values of the weights"""
+    def minimize_weight_bit_width(self, model, datatype_only=False):
+        """Minimize the bit width based on the values of the weights.
+
+        Parameters
+        ----------
+        datatype_only : bool
+            If True, skip value-based minimization.
+        """
+        if datatype_only:
+            return DataType[self.get_nodeattr("weightDataType")]
+
         if not (
             self.get_nodeattr("runtime_writeable_weights")
-            or self.get_nodeattr("mem_mode") == "external"
-            or self.get_nodeattr("mlo_max_iter")
-            or self.get_nodeattr("dynamic_input")
+            or self.get_nodeattr("mem_mode") in ["external", "external_mem", "dynamic"]
         ):
             weights = model.get_initializer(self.onnx_node.input[1])
+            if weights is None:
+                return DataType[self.get_nodeattr("weightDataType")]
             w_min = weights.min()
             w_max = weights.max()
             if w_min < 0:
@@ -574,6 +595,7 @@ class MVAU(HWCustomOp):
             else:
                 wdt = DataType.get_smallest_possible(w_max)
             self.set_nodeattr("weightDataType", wdt.name)
+
         return DataType[self.get_nodeattr("weightDataType")]
 
     def get_hw_compatible_threshold_tensor(self, orig_thres_matrix):
@@ -724,13 +746,79 @@ class MVAU(HWCustomOp):
             # flipped
             weight_tensor_pe_flipped = weight_tensor_pe_flipped.reshape(1, -1, pe * simd)
             weight_tensor_pe_flipped = weight_tensor_pe_flipped.copy()
+            # tiling
+            th = self.get_nodeattr("TH")
+            tinner = (pe * simd) // th
+            weight_tensor_simd_flipped = weight_tensor_simd_flipped.reshape(1, -1, tinner)
+            # The .dat weights are PE-flipped (np.flip axis=-2), which reverses the
+            # PE dimension - the same dimension that TH tiles into sub-tiles. This
+            # reverses the order of the TH sub-tiles within each PE group. Undo that
+            # by flipping the TH tile order back (no-op for th=1).
+            weight_tensor_pe_flipped = weight_tensor_pe_flipped.reshape(1, -1, th, tinner)
+            weight_tensor_pe_flipped = np.flip(weight_tensor_pe_flipped, axis=-2)
+            weight_tensor_pe_flipped = weight_tensor_pe_flipped.reshape(1, -1, tinner)
             if weight_file_mode == "decoupled_npy":
                 # save weight stream into npy for cppsim
                 np.save(weight_file_name, weight_tensor_simd_flipped)
+            elif weight_file_mode == "decoupled_verilog_dat" and (
+                self.get_nodeattr("mlo_max_iter") or self.get_nodeattr("mem_mode") == "external_mem"
+            ):
+                # AXI-MM / fetch_weights path (MLO and external_mem): the external
+                # memory image is DMA-word-aligned to match the wrapper VPC, which
+                # reads DMA_PE = DATA_BITS // WEIGHT_WIDTH whole elements from the low
+                # bits of each DATA_BITS-wide bus word (element 0 at the LSB) and
+                # discards the top DATA_BITS % WEIGHT_WIDTH padding bits. Storing one
+                # bus word per line (DATA_BITS bits) guarantees no element straddles a
+                # bus-word boundary; when WEIGHT_WIDTH divides DATA_BITS this reduces to
+                # tight packing (byte-identical to the previous per-group image).
+                #
+                # IWSIMD is (PE*SIMD)/TH for TH>1, SIMD otherwise. The element order
+                # within each IWSIMD group and the per-group ordering depend on how
+                # fetch_weights delivers the stream to the MVU:
+                #   - TH>1 (tiled MVAU): the stream passes straight through to the tiled
+                #     MVU, which expects the PE-flipped, TH-sub-tile-undone ordering.
+                #     weight_tensor_pe_flipped is already in IWSIMD-sized chunks
+                #     (tinner == (PE*SIMD)/TH == IWSIMD).
+                #   - TH=1 (standard MVAU): the stream goes through local_weight_buffer,
+                #     which distributes consecutive SIMD groups across PE lanes 0..PE-1
+                #     (pe-minor) and pairs weight SIMD lane s with activation SIMD lane s.
+                #     That reconstruction needs the natural (unflipped) PE/SIMD order.
+                # Within a group the VPC's little-endian (element 0 = LSB) consumption
+                # reverses the IWSIMD elements, so reverse each group here to build the
+                # flat element stream the VPC sees, then pack DMA_PE elements/bus word.
+                th = self.get_nodeattr("TH")
+                data_bits = 256  # DATA_BITS in fetch_weights.sv (AXI bus width)
+                iwsimd = (pe * simd) // th if th > 1 else simd
+                dma_pe = data_bits // export_wdt.bitwidth()  # whole elements per bus word
+                if th > 1:
+                    weight_tensor_iwsimd = weight_tensor_pe_flipped
+                else:
+                    weight_tensor_iwsimd = weight_tensor_unflipped.reshape(1, -1, pe * simd).copy()
+                # reverse within each IWSIMD group -> flat VPC little-endian element order
+                weight_tensor_iwsimd_groups = weight_tensor_iwsimd.reshape(1, -1, iwsimd)
+                flat_elems = weight_tensor_iwsimd_groups[:, :, ::-1].reshape(1, -1)
+                # pad the tail up to a whole number of bus words (unused VPC lanes)
+                n_elems = flat_elems.shape[1]
+                n_words = (n_elems + dma_pe - 1) // dma_pe
+                pad_elems = n_words * dma_pe - n_elems
+                if pad_elems:
+                    flat_elems = np.concatenate(
+                        [flat_elems, np.zeros((1, pad_elems), dtype=flat_elems.dtype)], axis=1
+                    )
+                # one bus word per line: DMA_PE elements packed element-0-at-LSB
+                # (reverse_inner=True), top bits zero-padded to DATA_BITS.
+                word_groups = flat_elems.reshape(1, n_words, dma_pe)
+                word_groups = pack_innermost_dim_as_hex_string(
+                    word_groups, export_wdt, data_bits, reverse_inner=True, prefix=""
+                )
+                weight_stream = word_groups.flatten().copy()
+                with open(weight_file_name, "w") as f:
+                    for val in weight_stream:
+                        f.write(val + "\n")
             elif weight_file_mode == "decoupled_verilog_dat":
                 # convert weight values into hexstring
                 weight_width = self.get_instream_width(1)
-                if self.get_nodeattr("dynamic_input"):
+                if self.get_nodeattr("mem_mode") == "dynamic":
                     weight_width = weight_width * simd
                 # pad to nearest 4 bits to get hex strings
                 weight_width_padded = roundup_to_integer_multiple(weight_width, 4)
@@ -762,7 +850,7 @@ class MVAU(HWCustomOp):
                 # memstream axi-lite interface will map each mem line to
                 # one or multiple 32-bit words
                 weight_width = self.get_instream_width(1)
-                if self.get_nodeattr("dynamic_input"):
+                if self.get_nodeattr("mem_mode") == "dynamic":
                     weight_width = weight_width * simd
                 words_per_memwidth = 2 ** math.ceil(math.log2(weight_width / 32))
                 if words_per_memwidth < 1:
@@ -793,25 +881,22 @@ class MVAU(HWCustomOp):
         # weights, if not external
         weights = model.get_initializer(self.onnx_node.input[1])
         if weights is not None:
-            if mem_mode == "internal_embedded":
-                # save hlslib-compatible weights in params.h
-                weight_filename = "{}/params.h".format(code_gen_dir)
-                self.make_weight_file(weights, "hls_header", weight_filename)
-            elif mem_mode == "internal_decoupled" or mem_mode == "external":
-                weight_filename_sim = "{}/input_1.npy".format(code_gen_dir)
-                # save internal_decoupled weights for cppsim
-                self.make_weight_file(weights, "decoupled_npy", weight_filename_sim)
-                if mem_mode == "internal_decoupled":
+            match mem_mode:
+                case "internal_embedded":
+                    # save hlslib-compatible weights in params.h
+                    weight_filename = "{}/params.h".format(code_gen_dir)
+                    self.make_weight_file(weights, "hls_header", weight_filename)
+                case "internal_decoupled" | "external" | "external_mem":
+                    weight_filename_sim = "{}/input_1.npy".format(code_gen_dir)
+                    # save internal_decoupled weights for cppsim
+                    self.make_weight_file(weights, "decoupled_npy", weight_filename_sim)
+                    # if mem_mode == "internal_decoupled":
                     # also save weights as Verilog .dat file
                     # This file will be ignored when synthesizing UltraScale memory.
                     weight_filename_rtl = "{}/memblock.dat".format(code_gen_dir)
                     self.make_weight_file(weights, "decoupled_verilog_dat", weight_filename_rtl)
         else:
-            if not (
-                mem_mode == "external"
-                or self.get_nodeattr("mlo_max_iter")
-                or self.get_nodeattr("dynamic_input")
-            ):
+            if mem_mode not in ["external", "dynamic", "external_mem"]:
                 raise Exception(
                     """Invalid setting found, weight values not initialized,
                     but neither "external" case nor MLO."""
@@ -831,9 +916,8 @@ class MVAU(HWCustomOp):
                 bin_xnor_mode = self.get_nodeattr("binaryXnorMode") == 1
                 inp_is_bipolar = inp_is_bipolar or (inp_is_binary and bin_xnor_mode)
                 wt_is_bipolar = wt_is_bipolar or (wt_is_binary and bin_xnor_mode)
-                # get computed threshold datatype from attribute
-                tdt = DataType[self.get_nodeattr("accDataType")]
-
+                # get computed threshold datatype from tensor
+                tdt = model.get_tensor_datatype(self.onnx_node.input[2])
                 assert np.vectorize(tdt.allowed)(
                     threshold_tensor
                 ).all(), "Thresholds in %s can't be expressed with type %s" % (
@@ -926,33 +1010,53 @@ class MVAU(HWCustomOp):
         if pumped_compute or self.get_nodeattr("pumpedMemory"):
             intf_names["clk2x"] = ["ap_clk2x"]
 
-        if self.get_nodeattr("mlo_max_iter"):
-            intf_names["aximm"].append(("axi_mm", 64))
-            intf_names["s_axis"].append(("in_idx0_V", 32))
-        else:
-            dynamic_input = self.get_nodeattr("dynamic_input")
-            mem_mode = self.get_nodeattr("mem_mode")
-            if dynamic_input:
-                weight_width = self.get_instream_width(1)
-                weight_width = weight_width * self.get_nodeattr("SIMD")
-                intf_names["s_axis"].append(("in1_V", roundup_to_integer_multiple(weight_width, 8)))
-            else:
-                if mem_mode == "external":
-                    intf_names["s_axis"].append(("in1_V", self.get_instream_width_padded(1)))
-                elif mem_mode == "internal_decoupled":
-                    # only expose axilite interface if attribute is set
-                    runtime_writeable = self.get_nodeattr("runtime_writeable_weights")
-                    if runtime_writeable:
-                        intf_names["axilite"] = ["s_axilite"]
+        match self.get_nodeattr("mem_mode"):
+            case "external_mem":
+                intf_names["aximm"].append(("axi_mm", 64))
+                if self.get_nodeattr("mlo_max_iter") > 0:
+                    intf_names["s_axis"].append(("in_idx0_V", 32))
+                    if get_by_name(self.onnx_node.attribute, "address_offset") is not None:
+                        intf_names["ap_none"].append("base_address")
+            case "dynamic" | "external":
+                intf_names["s_axis"].append(("in1_V", self.get_instream_width_padded(1)))
+            case "internal_decoupled":
+                # only expose axilite interface if attribute is set
+                if self.get_nodeattr("runtime_writeable_weights"):
+                    intf_names["axilite"] = ["s_axilite"]
+
         return intf_names
 
-    def code_generation_ipi(self):
-        source_target = "./ip/verilog/rtl_ops/%s" % self.onnx_node.name
-        cmd = ["file mkdir %s" % source_target]
-        dyn_input = self.get_nodeattr("dynamic_input")
+    def generate_infra_hdl(self, fpgapart):
+        """Generate the weight-infrastructure HDL (dynamic load / external-memory
+        fetch / on-chip memstream) for the streamed weight mem_modes. Shared by
+        the HLS and RTL MVAU backends; the compute-core HDL is generated by each
+        backend separately (RTLBackend.generate_hdl / HLSBackend codegen)."""
         mem_mode = self.get_nodeattr("mem_mode")
+
+        match mem_mode:
+            case "dynamic":
+                self.generate_hdl_dynload()
+            case "external_mem":
+                self.generate_hdl_fetch_weights()
+            case "internal_decoupled":
+                if self.get_nodeattr("ram_style") == "ultra" and not is_versal(fpgapart):
+                    assert (
+                        self.get_nodeattr("runtime_writeable_weights") == 1
+                    ), """Layer with URAM weights must have runtime_writeable_weights=1
+                        if Ultrascale device is targeted."""
+                self.generate_hdl_memstream(
+                    fpgapart, pumped_memory=self.get_nodeattr("pumpedMemory")
+                )
+
+    def code_generation_ipi(self):
+        cmd = []
+
+        #
         # check if additional components are needed
-        if mem_mode == "internal_decoupled" or self.get_nodeattr("mlo_max_iter") or dyn_input:
+        mem_mode = self.get_nodeattr("mem_mode")
+        if mem_mode in ["internal_decoupled", "dynamic", "external_mem"]:
+            #
+            # Base
             runtime_writeable = self.get_nodeattr("runtime_writeable_weights")
             node_name = self.onnx_node.name
             # create a hierarchy for this layer, with the same port names
@@ -984,133 +1088,185 @@ class MVAU(HWCustomOp):
                 "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s" % (node_name, din_name)
             )
 
-            if self.get_nodeattr("mlo_max_iter"):
-                cmd.append(
-                    "create_bd_intf_pin -mode Slave "
-                    "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s" % (node_name, "in_idx0_V")
-                )
-                cmd.append(
-                    "create_bd_intf_pin -mode Master "
-                    "-vlnv xilinx.com:interface:aximm_rtl:1.0 /%s/%s" % (node_name, "axi_mm")
-                )
-
             # Instantiate either the HLS or RTL IP depending on operator
             self.instantiate_ip(cmd)
             code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
-            if dyn_input:
-                # additional dynamic input
-                win_name = self.get_verilog_top_module_intf_names()["s_axis"][1][0]
-                cmd.append(
-                    "create_bd_intf_pin -mode Slave "
-                    "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s" % (node_name, win_name)
-                )
-                # dynamic loader
-                ram_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/ram/")
-                dyn_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/dynload/hdl/")
-                file_suffix = "_dynamic_load_wrapper.v"
-                # automatically find memstream verilog component in code generation directory
-                for fname in os.listdir(code_gen_dir):
-                    if fname.endswith(file_suffix):
-                        strm_tmpl = fname
-                strm_tmpl_name = strm_tmpl[:-2]
-                sourcefiles = [
-                    os.path.join(code_gen_dir, strm_tmpl),
-                    ram_rtllib_dir + "ram_p_c.sv",
-                    dyn_rtllib_dir + "dynamic_load.sv",
-                ]
-                for f in sourcefiles:
-                    cmd += ["add_files -copy_to %s -norecurse %s" % (source_target, f)]
-                strm_inst = node_name + "_wdynld"
-                strm_out_name = "m_axis_0"
-            elif self.get_nodeattr("mlo_max_iter"):
-                # instantiate a fetch weights component and connect it to the IP
-                mlo_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/mlo/")
-                reg_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/skid/")
-                ram_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/ram/")
-                dwc_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/dwc/hdl/")
-                dma_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/cdma/")
-                file_suffix = "_fetch_weights_wrapper.v"
-                # automatically find memstream verilog component in code generation directory
-                for fname in os.listdir(code_gen_dir):
-                    if fname.endswith(file_suffix):
-                        strm_tmpl = fname
-                strm_tmpl_name = strm_tmpl[:-2]
-                sourcefiles = [
-                    os.path.join(code_gen_dir, strm_tmpl),
-                    reg_rtllib_dir + "skid.sv",
-                    ram_rtllib_dir + "ram_p_c.sv",
-                    dwc_rtllib_dir + "axis_adapter.v",
-                    dwc_rtllib_dir + "axis_fifo_adapter.sv",
-                    dwc_rtllib_dir + "axis_fifo.v",
-                    mlo_rtllib_dir + "fetch_weights.sv",
-                    mlo_rtllib_dir + "local_weight_buffer.sv",
-                ]
-                # add files from cdma dir
-                for file in os.listdir(dma_rtllib_dir):
-                    if file.endswith(".sv") or file.endswith(".svh"):
-                        sourcefiles.append(os.path.join(dma_rtllib_dir, file))
-                for file in os.listdir(dma_rtllib_dir + "cdma_a/"):
-                    if file.endswith(".sv") or file.endswith(".svh"):
-                        sourcefiles.append(os.path.join(dma_rtllib_dir + "cdma_a/", file))
-                for file in os.listdir(dma_rtllib_dir + "cdma_u/"):
-                    if file.endswith(".sv") or file.endswith(".svh"):
-                        sourcefiles.append(os.path.join(dma_rtllib_dir + "cdma_u/", file))
-                for file in os.listdir(dma_rtllib_dir + "cdma_x/"):
-                    if file.endswith(".sv") or file.endswith(".svh"):
-                        sourcefiles.append(os.path.join(dma_rtllib_dir + "cdma_x/", file))
 
-                for f in sourcefiles:
-                    cmd += ["add_files -copy_to %s -norecurse %s" % (source_target, f)]
-                strm_inst = node_name + "_fetch_weights"
-                strm_out_name = "out0_V"
-                # update intf dict to remove weights input and replace with index/tap input
-                self.get_verilog_top_module_intf_names()["s_axis"]
+            match mem_mode:
+                #
+                # Dynamic loader instantiation
+                case "dynamic":
+                    # additional dynamic input
+                    win_name = self.get_verilog_top_module_intf_names()["s_axis"][1][0]
+                    cmd.append(
+                        "create_bd_intf_pin -mode Slave "
+                        "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s" % (node_name, win_name)
+                    )
 
-            elif mem_mode == "internal_decoupled":
-                # instantiate a streamer and connect it to the IP
-                axi_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/axi/hdl/")
-                ms_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/memstream/hdl/")
-                file_suffix = "_memstream_wrapper.v"
-                # automatically find memstream verilog component in code generation directory
-                for fname in os.listdir(code_gen_dir):
-                    if fname.endswith(file_suffix):
-                        strm_tmpl = fname
-                strm_tmpl_name = strm_tmpl[:-2]
-                sourcefiles = [
-                    os.path.join(code_gen_dir, strm_tmpl),
-                    axi_dir + "axilite.sv",
-                    ms_rtllib_dir + "memstream_axi.sv",
-                    ms_rtllib_dir + "memstream.sv",
-                ]
-                for f in sourcefiles:
-                    cmd += ["add_files -copy_to %s -norecurse %s" % (source_target, f)]
-                strm_inst = node_name + "_wstrm"
-                strm_out_name = "m_axis_0"
+                    # dynamic loader
+                    dyn_rtllib_dir = os.path.join(
+                        os.environ["FINN_ROOT"], "finn-rtllib/dynload/hdl/"
+                    )
+                    file_suffix = "_dynamic_load_wrapper.v"
+                    # automatically find memstream verilog component in code generation directory
+                    for fname in os.listdir(code_gen_dir):
+                        if fname.endswith(file_suffix):
+                            strm_tmpl = fname
+                    strm_tmpl_name = strm_tmpl[:-2]
+                    sourcefiles = [
+                        os.path.join(code_gen_dir, strm_tmpl),
+                        dyn_rtllib_dir + "dynamic_load.sv",
+                    ]
+                    for f in sourcefiles:
+                        cmd += ["add_files -norecurse %s" % f]
+                    strm_inst = node_name + "_wdynld"
+                    strm_out_name = "m_axis_0"
+
+                #
+                # Fetch weights instantiation (MLO and tiling)
+                case "external_mem":
+                    # additional inputs
+                    cmd.append(
+                        "create_bd_intf_pin -mode Master "
+                        "-vlnv xilinx.com:interface:aximm_rtl:1.0 /%s/%s" % (node_name, "axi_mm")
+                    )
+                    if self.get_nodeattr("mlo_max_iter") > 0:
+                        cmd.append(
+                            "create_bd_intf_pin -mode Slave "
+                            "-vlnv xilinx.com:interface:axis_rtl:1.0 /%s/%s"
+                            % (node_name, "in_idx0_V")
+                        )
+
+                        if get_by_name(self.onnx_node.attribute, "address_offset") is not None:
+                            ba_name = self.get_verilog_top_module_intf_names()["ap_none"][0]
+                            cmd.append(
+                                "create_bd_pin -dir I -from 63 -to 0 /%s/%s" % (node_name, ba_name)
+                            )
+
+                    # instantiate a fetch weights component and connect it to the IP
+                    reg_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/skid/")
+                    fwg_rtllib_dir = os.path.join(
+                        os.environ["FINN_ROOT"], "finn-rtllib/fetch_weights/"
+                    )
+                    dma_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/cdma/")
+                    file_suffix = "_fetch_weights_wrapper.v"
+                    # automatically find memstream verilog component in code generation directory
+                    for fname in os.listdir(code_gen_dir):
+                        if fname.endswith(file_suffix):
+                            strm_tmpl = fname
+                    strm_tmpl_name = strm_tmpl[:-2]
+                    dwc_rtllib_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/dwc/hdl/")
+                    sourcefiles = [
+                        os.path.join(code_gen_dir, strm_tmpl),
+                        reg_rtllib_dir + "skid.sv",
+                        fwg_rtllib_dir + "fetch_weights.sv",
+                        fwg_rtllib_dir + "local_weight_buffer.sv",
+                        dwc_rtllib_dir + "vpc.sv",
+                        dwc_rtllib_dir + "dwc_axi.sv",
+                    ] + fifo_rtl_files()
+                    # Create Vivado axis_dwidth_converter IP
+                    theight = self.get_nodeattr("TH")
+                    wdt = self.get_input_datatype(1)
+                    if theight > 1:
+                        iwsimd = (self.get_nodeattr("PE") * self.get_nodeattr("SIMD")) // theight
+                    else:
+                        iwsimd = self.get_nodeattr("SIMD")
+                    ds_bits_ba = ((iwsimd * wdt.bitwidth() + 7) // 8) * 8
+                    dwc_ip_name = node_name + "_dwc"
+                    s_bytes = 256 // 8
+                    m_bytes = ds_bits_ba // 8
+                    cmd += [
+                        "create_ip -name axis_dwidth_converter -vendor xilinx.com "
+                        "-library ip -version 1.1 -module_name %s" % dwc_ip_name,
+                        "set_property -dict [list "
+                        "CONFIG.S_TDATA_NUM_BYTES {%d} "
+                        "CONFIG.M_TDATA_NUM_BYTES {%d} "
+                        "CONFIG.HAS_TLAST {1} "
+                        "CONFIG.HAS_TKEEP {1} "
+                        "] [get_ips %s]" % (s_bytes, m_bytes, dwc_ip_name),
+                        "generate_target all [get_ips %s]" % dwc_ip_name,
+                    ]
+
+                    # add files from cdma dir
+                    for file in os.listdir(dma_rtllib_dir):
+                        if file.endswith(".sv") or file.endswith(".svh"):
+                            sourcefiles.append(os.path.join(dma_rtllib_dir, file))
+                    for file in os.listdir(dma_rtllib_dir + "cdma_a/"):
+                        if file.endswith(".sv") or file.endswith(".svh"):
+                            sourcefiles.append(os.path.join(dma_rtllib_dir + "cdma_a", file))
+                    for file in os.listdir(dma_rtllib_dir + "cdma_u/"):
+                        if file.endswith(".sv") or file.endswith(".svh"):
+                            sourcefiles.append(os.path.join(dma_rtllib_dir + "cdma_u/", file))
+                    for file in os.listdir(dma_rtllib_dir + "cdma_x/"):
+                        if file.endswith(".sv") or file.endswith(".svh"):
+                            sourcefiles.append(os.path.join(dma_rtllib_dir + "cdma_x/", file))
+                    for f in sourcefiles:
+                        cmd += ["add_files -norecurse %s" % f]
+                    strm_inst = node_name + "_fetch_weights"
+                    strm_out_name = "out0_V"
+                    # update intf dict to remove weights input and replace with index/tap input
+                    self.get_verilog_top_module_intf_names()["s_axis"]
+
+                #
+                # Memstream instantiation
+                case "internal_decoupled":
+                    # instantiate a streamer and connect it to the IP
+                    axi_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/axi/hdl/")
+                    ms_rtllib_dir = os.path.join(
+                        os.environ["FINN_ROOT"], "finn-rtllib/memstream/hdl/"
+                    )
+                    file_suffix = "_memstream_wrapper.v"
+                    # automatically find memstream verilog component in code generation directory
+                    for fname in os.listdir(code_gen_dir):
+                        if fname.endswith(file_suffix):
+                            strm_tmpl = fname
+                    strm_tmpl_name = strm_tmpl[:-2]
+                    sourcefiles = [
+                        os.path.join(code_gen_dir, strm_tmpl),
+                        axi_dir + "axilite.sv",
+                        ms_rtllib_dir + "memstream_axi.sv",
+                        ms_rtllib_dir + "memstream.sv",
+                    ]
+                    for f in sourcefiles:
+                        cmd += ["add_files -norecurse %s" % f]
+                    strm_inst = node_name + "_wstrm"
+                    strm_out_name = "m_axis_0"
 
             cmd.append(
                 "create_bd_cell -type hier -reference %s /%s/%s"
                 % (strm_tmpl_name, node_name, strm_inst)
             )
 
-            if self.get_nodeattr("mlo_max_iter"):
-                cmd.append(
-                    "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
-                    "[get_bd_intf_pins %s/%s/%s]"
-                    % (node_name, "in_idx0_V", node_name, strm_inst, "in_idx0_V")
-                )
+            #
+            # Connect
+            match mem_mode:
+                case "dynamic":
+                    cmd.append(
+                        "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
+                        "[get_bd_intf_pins %s/%s/s_axis_0]"
+                        % (node_name, win_name, node_name, strm_inst)
+                    )
 
-                cmd.append(
-                    "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
-                    "[get_bd_intf_pins %s/%s/%s]"
-                    % (node_name, "axi_mm", node_name, strm_inst, "axi_mm")
-                )
+                case "external_mem":
+                    cmd.append(
+                        "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
+                        "[get_bd_intf_pins %s/%s/%s]"
+                        % (node_name, "axi_mm", node_name, strm_inst, "axi_mm")
+                    )
+                    if self.get_nodeattr("mlo_max_iter") > 0:
+                        cmd.append(
+                            "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
+                            "[get_bd_intf_pins %s/%s/%s]"
+                            % (node_name, "in_idx0_V", node_name, strm_inst, "in_idx0_V")
+                        )
 
-            if dyn_input:
-                cmd.append(
-                    "connect_bd_intf_net [get_bd_intf_pins %s/%s] "
-                    "[get_bd_intf_pins %s/%s/s_axis_0]"
-                    % (node_name, win_name, node_name, strm_inst)
-                )
+                        if get_by_name(self.onnx_node.attribute, "address_offset") is not None:
+                            cmd.append(
+                                "connect_bd_net [get_bd_pins %s/%s] "
+                                "[get_bd_pins %s/%s/%s]"
+                                % (node_name, "base_address", node_name, strm_inst, "base_address")
+                            )
+
             cmd.append(
                 "connect_bd_intf_net [get_bd_intf_pins %s/%s/%s] "
                 "[get_bd_intf_pins %s/%s/in1_V]"
@@ -1124,11 +1280,10 @@ class MVAU(HWCustomOp):
                 "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_clk]"
                 % (node_name, clk_name, node_name, strm_inst)
             )
+
             # if using 2x pumped memory, connect the memstreamer's 2x clk input
             # to the 2x clock port. otherwise connect it to the regular clock port.
-            if mem_mode == "internal_decoupled" and not (
-                self.get_nodeattr("mlo_max_iter") or dyn_input
-            ):
+            if mem_mode == "internal_decoupled":
                 if self.get_nodeattr("pumpedMemory"):
                     cmd.append(
                         "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_clk2x]"
@@ -1139,8 +1294,8 @@ class MVAU(HWCustomOp):
                         "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/ap_clk2x]"
                         % (node_name, clk_name, node_name, strm_inst)
                     )
-                # runtime writeable weights
-                if runtime_writeable:
+                # runtime writeable weights (skip for MLO nodes)
+                if runtime_writeable and not self.get_nodeattr("mlo_max_iter"):
                     axilite_name = self.get_verilog_top_module_intf_names()["axilite"][0]
                     cmd.append(
                         "create_bd_intf_pin -mode Slave "
@@ -1154,6 +1309,7 @@ class MVAU(HWCustomOp):
                     )
                     # TODO calculate and pass in segment size here
                     cmd.append("assign_bd_address")
+
             cmd.append(
                 "connect_bd_net [get_bd_pins %s/%s] [get_bd_pins %s/%s/%s]"
                 % (node_name, rst_name, node_name, node_name, rst_name)
@@ -1175,11 +1331,27 @@ class MVAU(HWCustomOp):
 
             # save bd
             cmd.append("save_bd_design")
-        elif (mem_mode == "internal_embedded" or mem_mode == "external") and not self.get_nodeattr(
-            "mlo_max_iter"
-        ):
+
+        elif mem_mode in ["internal_embedded", "external"]:
             # base class impl sufficient for internal_embedded/external modes
             self.instantiate_ip(cmd)
+
         else:
             raise Exception("Unrecognized mem_mode for MatrixVectorActivation")
+
         return cmd
+
+    def get_weight_mem_bytes(self):
+        """Return (size, offs) in bytes for one layer's weight matrix.
+        The DDR image is DMA-word-aligned: each DATA_BITS-wide bus word holds
+        DMA_PE = DATA_BITS // WEIGHT_WIDTH whole elements (top bits zero-padded),
+        so the per-layer size is ceil(MH*MW / DMA_PE) bus words. That is already
+        bus-aligned, so offs == size == LAYER_OFFS in fetch_weights.sv."""
+        data_bits = 256  # DATA_BITS in fetch_weights.sv
+        weight_width = self.get_input_datatype(1).bitwidth()
+        dma_pe = data_bits // weight_width  # whole elements per bus word
+        n_elems = self.get_nodeattr("MH") * self.get_nodeattr("MW")
+        n_words = roundup_to_integer_multiple(n_elems, dma_pe) // dma_pe
+        size = n_words * (data_bits // 8)
+        offs = size  # already AXI bus-width aligned
+        return size, offs

@@ -31,7 +31,6 @@ import pytest
 
 import importlib_resources as importlib
 import numpy as np
-import os
 import torch
 from brevitas.export import export_qonnx
 from qonnx.core.modelwrapper import ModelWrapper
@@ -44,6 +43,7 @@ from qonnx.transformation.general import (
     GiveUniqueParameterTensors,
 )
 from qonnx.transformation.infer_data_layouts import InferDataLayouts
+from qonnx.transformation.infer_datatypes import InferDataTypes
 from qonnx.transformation.infer_shapes import InferShapes
 from qonnx.transformation.lower_convs_to_matmul import LowerConvsToMatMul
 from qonnx.util.cleanup import cleanup as qonnx_cleanup
@@ -52,15 +52,21 @@ import finn.core.onnx_exec as oxe
 import finn.transformation.fpgadataflow.convert_to_hw_layers as to_hw
 import finn.transformation.streamline.absorb as absorb
 from finn.transformation.fpgadataflow.compile_cppsim import CompileCppSim
+from finn.transformation.fpgadataflow.minimize_accumulator_width import (
+    MinimizeAccumulatorWidth,
+)
+from finn.transformation.fpgadataflow.minimize_weight_bit_width import (
+    MinimizeWeightBitWidth,
+)
 from finn.transformation.fpgadataflow.prepare_cppsim import PrepareCppSim
 from finn.transformation.fpgadataflow.set_exec_mode import SetExecMode
 from finn.transformation.fpgadataflow.specialize_layers import SpecializeLayers
 from finn.transformation.qonnx.convert_qonnx_to_finn import ConvertQONNXtoFINN
 from finn.transformation.streamline import Streamline
 from finn.transformation.streamline.reorder import MakeMaxPoolNHWC
+from finn.transformation.streamline.round_thresholds import RoundAndClipThresholds
+from finn.util.basic import make_build_dir, robust_rmtree
 from finn.util.test import get_test_model_trained
-
-export_onnx_path_cnv = "test_convert_to_hw_layers_cnv.onnx"
 
 
 @pytest.mark.fpgadataflow
@@ -68,6 +74,15 @@ export_onnx_path_cnv = "test_convert_to_hw_layers_cnv.onnx"
 # Standalone or fused thresholding-based activation
 @pytest.mark.parametrize("fused_activation", [True, False])
 def test_convert_to_hw_layers_cnv_w1a1(fused_activation):
+    build_dir = make_build_dir(prefix="test_convert_to_hw_layers_cnv_")
+    try:
+        _test_convert_to_hw_layers_cnv_w1a1(fused_activation, build_dir)
+    finally:
+        robust_rmtree(build_dir)
+
+
+def _test_convert_to_hw_layers_cnv_w1a1(fused_activation, build_dir):
+    export_onnx_path_cnv = f"{build_dir}/test_convert_to_hw_layers_cnv.onnx"
     cnv = get_test_model_trained("CNV", 1, 1)
     export_qonnx(cnv, torch.randn(1, 3, 32, 32), export_onnx_path_cnv)
     qonnx_cleanup(export_onnx_path_cnv, out_file=export_onnx_path_cnv)
@@ -142,6 +157,16 @@ def test_convert_to_hw_layers_cnv_w1a1(fused_activation):
     assert len(swg_nodes) == 8
     mp_nodes = model.get_nodes_by_op_type("Pool_hls")
     assert len(mp_nodes) == 2
+    model = model.transform(MinimizeWeightBitWidth())
+    model = model.transform(MinimizeAccumulatorWidth())
+    # make sure the changed datatypes are propagated through the network
+    model = model.transform(InferDataTypes())
+    # Always run RoundAndClipThresholds after accumulator widths are determined
+    model = model.transform(RoundAndClipThresholds())
+    model = model.transform(InferDataTypes())
+    # Run MinimizeWeightBitWidth again to minimize threshold datatypes after rounding/clipping
+    model = model.transform(MinimizeWeightBitWidth())
+    model = model.transform(InferDataTypes())
     model = model.transform(PrepareCppSim())
     model = model.transform(CompileCppSim())
     model = model.transform(SetExecMode("cppsim"))
@@ -149,4 +174,3 @@ def test_convert_to_hw_layers_cnv_w1a1(fused_activation):
     produced = produced_ctx[model.get_first_global_out()]
     assert np.isclose(expected, produced, atol=1e-3).all()
     assert np.argmax(produced) == 3
-    os.remove(export_onnx_path_cnv)

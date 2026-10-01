@@ -1,0 +1,308 @@
+/****************************************************************************
+ * Copyright (C) 2026, Advanced Micro Devices, Inc.
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * @author	Thomas B. Preußer <thomas.preusser@amd.com>
+ * @brief	Integer requantization from K to N bits by clip(round(x*scale+bias)).
+ *
+ * @description
+ *	Performs an integer requantization from K to N bits as by computing:
+ *		round(x*scale+bias)
+ *	The used single-precision floating-point scale and bias parameters are
+ *	rotated round-robin through the list of C channel-specific values.
+ *
+ *	The floating-point scale and bias are decomposed into fixed-point
+ *	representations at elaboration time (derive_PARAMS). The scale
+ *	mantissa is captured in S_WIDTH-1 magnitude bits (+ sign). When
+ *	K <= DSP port width, S_WIDTH=25 and all 24 IEEE 754 significand
+ *	bits are preserved exactly. When K exceeds the DSP port width,
+ *	S_WIDTH < 25 and the mantissa is rounded to fewer bits.
+ *
+ *	The integer multiply (x * scale_fixed) is exact within the product
+ *	datapath — unlike a single-precision floating-point multiply, which
+ *	rounds its result to 24 significant bits. Consequently, for
+ *	non-power-of-two scales (dense mantissa fractions), the hardware
+ *	result may differ by ±1 from a single-precision evaluation of
+ *	round(scale*x+bias). Power-of-two scales (zero mantissa fraction)
+ *	produce bit-exact agreement with the floating-point specification.
+ *
+ *	Similarly, the bias mantissa is aligned into the product datapath
+ *	by shifting. When the bias exponent is small relative to the shift
+ *	position, right-shifting truncates least-significant mantissa bits,
+ *	which can also contribute to ±1 deviations at rounding boundaries.
+ ***************************************************************************/
+
+module requant #(
+	int unsigned  VERSION = 1,  // DSP Version
+	int unsigned  K,  // Input Precision
+	int unsigned  N,  // Output Precision
+
+	int unsigned  C,       // Channel count
+	int unsigned  PE = 1,  // Vector parallelism, must divide C
+
+	shortreal     SCALES[PE][C/PE],
+	shortreal     BIASES[PE][C/PE],
+
+	bit  SIGNED_OUT = 0  // 0: unsigned clip [0, 2^N-1], 1: signed clip [-2^(N-1), 2^(N-1)-1]
+)(
+	input	logic  clk,
+	input	logic  rst,
+
+	input	logic signed [PE-1:0][K-1:0]  idat,
+	input	logic  ivld,
+
+	output	logic [PE-1:0][N-1:0]  odat,
+	output	logic  ovld
+);
+`default_nettype none
+	localparam int unsigned  CF = C/PE;  // Channel fold
+
+	// Parameter Constraints Checking
+	initial begin
+		if(CF*PE != C) begin
+			$error("%m: Parallelism PE=%0d does not divide channel count C=%0d.", PE, C);
+			$finish;
+		end
+	end
+
+	// Derive allowable multiplier input widths and implied datapath assignments
+	typedef struct {
+		int unsigned  s;
+		int unsigned  x;
+	} mul_widths_t;
+	function automatic mul_widths_t derive_MUL_WIDTHS();
+		mul_widths_t  res;
+
+		int unsigned  aw;
+		int unsigned  bw;
+		unique case(VERSION)
+		1: begin  aw = 25; bw = 18; end
+		2: begin  aw = 27; bw = 18; end
+		3: begin  aw = 27; bw = 24; end
+		default: begin
+			$error("%m: Unsupported DSP VERSION %0d.", VERSION);
+			$finish;
+		end
+		endcase
+		if(K <= bw) begin
+			res.x = K;
+			res.s = 25;
+		end
+		else begin
+			res.x = aw < K? aw : K;
+			res.s = bw;
+		end
+
+		return  res;
+
+	endfunction : derive_MUL_WIDTHS
+	localparam mul_widths_t  MUL_WIDTHS = derive_MUL_WIDTHS();
+
+	// Derive fixed-point parameters for requantization
+	typedef struct {
+		bit signed   [MUL_WIDTHS.s               -1:0]  scale;
+		bit signed   [MUL_WIDTHS.s + MUL_WIDTHS.x  :0]  bias;
+		int unsigned  shift;
+	} params_t;
+	typedef params_t  params_mat_t[PE][CF];
+	function automatic params_mat_t derive_PARAMS();
+		params_mat_t  res;
+		foreach(res[pe, cf]) begin
+			params_t  p;
+
+			// Decomposed Scale
+			bit [31:0]  s = $shortrealtobits(SCALES[pe][cf]);
+			bit [ 7:0]  sc = s[23+:8];
+			bit [24:0]  sm = { 1'b1, s[0+:23], 1'b0 }; // * 2^-24
+			int         se = int'(sc) - 127;
+
+			// Decomposed Bias
+			bit [31:0]  b = $shortrealtobits(BIASES[pe][cf]);
+			bit [ 7:0]  bc = b[23+:8];
+			bit [23:0]  bm = { 1'b1, b[0+:23] }; // * 2^-23
+			int         be = int'(bc) - 127;
+
+			// Shift amount from Product Datapath
+			p.shift = (MUL_WIDTHS.s - 2) - se;
+			if(p.shift < 0) begin
+				$error("%m: Scale is too large for the output precision.");
+				$finish;
+			end
+			if(MUL_WIDTHS.s + MUL_WIDTHS.x + 1 < p.shift+N) begin
+				$error("%m: Scale is too small for the output precision.");
+				$finish;
+			end
+
+			// Mantissa into Product Datapath
+			sm >>= (25 - MUL_WIDTHS.s);
+			p.scale = sm[1+:24] + sm[0];
+			if(s[31])  p.scale = -p.scale;
+
+			// Align Bias Mantissa into Product Datapath
+			if(be > int'(MUL_WIDTHS.x - N)) begin
+				$error("%m: Bias overflows the output range.");
+				$finish;
+			end
+			else begin
+				// - p.shift identifies the number of fractional bits in the product datapath, bm comes with 23
+				// - a bias exponent equal to 23-p.shift requires no shifting of its mantissa for alignment
+				// - a bias exponent smaller than 23-p.shift requires a right shift
+				// - a bias exponent larger than 23-p.shift requires a left shift
+				automatic int  bias_shift = be - (23 - p.shift);
+				p.bias =
+					(bias_shift < -24)? 0 :
+					(bias_shift <   0)? bm >> -bias_shift :
+					/* else */          bm <<  bias_shift;
+
+					if(b[31])  p.bias = -p.bias;
+
+					// Rounding
+					if(p.shift > 0)          p.bias += 1 << (p.shift-1);
+					else if(bias_shift < 0)  p.bias += bm[-bias_shift-1];
+			end
+
+			res[pe][cf] = p;
+		end
+		return  res;
+	endfunction : derive_PARAMS
+	localparam params_mat_t  PARAMS = derive_PARAMS();
+	initial begin
+		for(int unsigned  pe = 0; pe < PE; pe++) begin
+			for(int unsigned  cf = 0; cf < CF; cf++) begin
+				automatic bit [31:0]  s = $shortrealtobits(SCALES[pe][cf]);
+				if(s[22:0] != 0 && 25 > MUL_WIDTHS.s) begin
+					// Dense mantissa with S_WIDTH < 25: check for actual bit loss
+					automatic bit [24:0]  sm = { 1'b1, s[0+:23], 1'b0 };
+					if(sm[0+:25-MUL_WIDTHS.s] != 0)
+						$warning("%m: SCALES[%0d][%0d] scale mantissa truncated (%0d to %0d bits).", pe, cf, 25, MUL_WIDTHS.s);
+				end
+			end
+		end
+	end
+	typedef struct {
+		int unsigned  min;
+		int unsigned  max;
+	} minmax_t;
+	function automatic minmax_t derive_SHIFT_MINMAX(input int unsigned  pe);
+		minmax_t  res = '{ min: 2**32-1, max: 0 };
+		for(int unsigned  cf = 0; cf < CF; cf++) begin
+			automatic int unsigned  shift = PARAMS[pe][cf].shift;
+			if(shift < res.min)  res.min = shift;
+			if(shift > res.max)  res.max = shift;
+		end
+
+		return  res;
+	endfunction : derive_SHIFT_MINMAX
+
+	int unsigned  cnl_sel;
+	if(CF == 1)  assign  cnl_sel = 0;
+	else begin
+		logic [$clog2(CF)-1:0]  CnlCnt = 0;
+		always_ff @(posedge clk) begin
+			if(rst)        CnlCnt <= 0;
+			else if(ivld)  CnlCnt <= CnlCnt + (CnlCnt != CF-1? 1 : (2**$clog2(CF)-CF)+1);
+		end
+		assign	cnl_sel = CnlCnt;
+	end
+
+	// Global valid flag forwarding
+	logic  Vld[4] = '{ default: 0 };
+	always_ff @(posedge clk) begin
+		if(rst)  Vld <= '{ default: 0 };
+		else     Vld <= { ivld, Vld[0:2] };
+	end
+	assign	ovld = Vld[3];
+
+	// Instantiate individual compute lanes
+	for(genvar  pe = 0; pe < PE; pe++) begin : genPE
+		localparam minmax_t  SHIFT_MINMAX = derive_SHIFT_MINMAX(pe);
+		localparam int unsigned  SHIFT_RANGE = SHIFT_MINMAX.max - SHIFT_MINMAX.min + 1;
+		typedef logic [((SHIFT_RANGE > 1)? $clog2(SHIFT_RANGE) : 1)-1:0]  shift_t;
+
+		logic signed [             MUL_WIDTHS.x-1:0]  X1 = 'x;
+		logic signed [MUL_WIDTHS.s             -1:0]  S1 = 'x;
+		logic signed [MUL_WIDTHS.s+MUL_WIDTHS.x-1:0]  B1 = 'x;
+		shift_t  T1 = 'x;
+		always_ff @(posedge clk) begin
+			if(rst) begin
+				X1 <= 'x;
+				S1 <= 'x;
+				B1 <= 'x;
+				T1 <= 'x;
+			end
+			else begin
+				automatic params_t  p = PARAMS[pe][cnl_sel];
+				X1 <= K > MUL_WIDTHS.x? idat[pe][K-MUL_WIDTHS.x+:MUL_WIDTHS.x] : idat[pe];
+				S1 <= p.scale;
+				B1 <= p.bias;
+				T1 <= p.shift - SHIFT_MINMAX.min;
+			end
+		end
+
+		logic signed [MUL_WIDTHS.s+MUL_WIDTHS.x-1:0]  M2 = 'x;
+		logic signed [MUL_WIDTHS.s+MUL_WIDTHS.x-1:0]  B2 = 'x;
+		shift_t  T2 = 'x;
+		always_ff @(posedge clk) begin
+			if(rst) begin
+				M2 <= 'x;
+				B2 <= 'x;
+				T2 <= 'x;
+			end
+			else begin
+				M2 <= X1 * S1;
+				B2 <= B1;
+				T2 <= T1;
+			end
+		end
+
+		logic signed [MUL_WIDTHS.s+MUL_WIDTHS.x:0]  P3 = 'x;
+		shift_t  T3 = 'x;
+		always_ff @(posedge clk) begin
+			if(rst) begin
+				P3 <= 'x;
+				T3 <= 'x;
+			end
+			else begin
+				P3 <= M2 + B2;
+				T3 <= T2;
+			end
+		end
+
+		logic [N-1:0]  R4 = 'x;
+		localparam int unsigned  SHIFT_SPAN = SHIFT_MINMAX.max - SHIFT_MINMAX.min;
+		uwire  neg = P3[$left(P3)];
+		if(!SIGNED_OUT) begin : blkStage4Unsigned
+			uwire [SHIFT_SPAN + N-1:0]  win = P3[SHIFT_MINMAX.max+N-1 : SHIFT_MINMAX.min];
+			uwire [SHIFT_SPAN + N-1:0]  shifted = win >> T3;
+			uwire  ovf =
+				(($left(P3)        > SHIFT_MINMAX.max+N)? |P3[$left(P3)-1:SHIFT_MINMAX.max+N] : 0) ||
+				((SHIFT_MINMAX.min < SHIFT_MINMAX.max  )? |shifted[$left(shifted):N] : 0);
+			always_ff @(posedge clk) begin
+				if(rst)  R4 <= 'x;
+				else begin
+					R4 <=
+						neg?  0 :
+						ovf? '1 :
+						shifted[N-1:0];
+				end
+			end
+		end : blkStage4Unsigned
+		else begin : blkStage4Signed
+			uwire signed [SHIFT_SPAN + N-1:0]  win = P3[SHIFT_MINMAX.max+N-1 : SHIFT_MINMAX.min];
+			uwire signed [SHIFT_SPAN + N-1:0]  shifted = win >>> T3;
+			uwire  ovf =
+				(($left(P3)        > SHIFT_MINMAX.max+N-1)? |(P3[$left(P3)-1:SHIFT_MINMAX.max+N-1] ^ {($left(P3)-SHIFT_MINMAX.max-N+1){neg}}) : 0) ||
+				((SHIFT_MINMAX.min < SHIFT_MINMAX.max    )? ~(&shifted[$left(shifted):N-1]) && (|shifted[$left(shifted):N-1]) : 0);
+			always_ff @(posedge clk) begin
+				if(rst)  R4 <= 'x;
+				else     R4 <= ovf? {neg, {(N-1){!neg}}} : shifted[N-1:0];
+			end
+		end : blkStage4Signed
+
+		assign	odat[pe] = R4;
+	end : genPE
+
+`default_nettype wire
+endmodule : requant

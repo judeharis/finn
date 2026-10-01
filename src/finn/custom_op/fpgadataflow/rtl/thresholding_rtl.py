@@ -29,7 +29,6 @@
 import math
 import numpy as np
 import os
-import shutil
 from qonnx.core.datatype import DataType
 from qonnx.util.basic import roundup_to_integer_multiple
 
@@ -89,16 +88,20 @@ class Thresholding_rtl(Thresholding, RTLBackend):
         odt_bits = odt.bitwidth()
         t_channels = self.get_nodeattr("NumChannels")
         cf = t_channels / pe
+        # For MLO, multiply depth by number of sets (iterations)
+        mlo_sets = max(1, self.get_nodeattr("mlo_max_iter"))
         is_uniform = self.get_nodeattr("uniform_thres")
         if is_uniform:
-            ret = [(odt_bits - x, cf * (2**x)) for x in range(1, odt_bits)]
+            ret = [(odt_bits - x, cf * (2**x) * mlo_sets) for x in range(1, odt_bits)]
         else:
-            ret = [(wdt_bits, (cf) * 2**x) for x in range(odt_bits)]
+            ret = [(wdt_bits, cf * (2**x) * mlo_sets) for x in range(odt_bits)]
         return ret
 
-    def get_memory_estimate(self):
-        """return the memory estimate for this node"""
+    def _get_memory_estimate_details(self):
+        """return resource count, used bits and allocated capacity by memory type"""
         res_dict = {}
+        used_bits = {}
+        capacity_bits = {}
         depth_trigger_bram = self.get_nodeattr("depth_trigger_bram")
         depth_trigger_uram = self.get_nodeattr("depth_trigger_uram")
         pe = self.get_nodeattr("PE")
@@ -113,25 +116,56 @@ class Thresholding_rtl(Thresholding, RTLBackend):
                     primitives = {k: v for (k, v) in mem_primitives_versal.items() if "URAM" in k}
             alts = get_memutil_alternatives(mem_cfg, primitives)
             primary_alt = alts[0]
-            res_type = primary_alt[0].split("_")[0]
+            primitive_name = primary_alt[0]
+            if primitive_name.startswith("BRAM"):
+                res_type = "BRAM"
+            else:
+                res_type = primitive_name.split("_")[0]
             res_count, eff, waste = primary_alt[1]
+            primitive_width, primitive_depth = mem_primitives_versal[primitive_name]
             res_dict[res_type] = res_dict.get(res_type, 0) + pe * res_count
+            used_bits[res_type] = used_bits.get(res_type, 0) + pe * width * depth
+            capacity_bits[res_type] = capacity_bits.get(res_type, 0) + (
+                pe * res_count * primitive_width * primitive_depth
+            )
+        return res_dict, used_bits, capacity_bits
+
+    def get_memory_estimate(self):
+        """return the memory estimate for this node"""
+        res_dict, _, _ = self._get_memory_estimate_details()
         return res_dict
 
-    def bram_estimation(self):
+    def bram_estimation(self, fpgapart):
         """return the number of BRAMs required for this node"""
         res_dict = self.get_memory_estimate()
         return res_dict.get("BRAM", 0)
 
-    def uram_estimation(self):
+    def uram_estimation(self, fpgapart):
         """return the number of URAMs required for this node"""
         res_dict = self.get_memory_estimate()
         return res_dict.get("URAM", 0)
 
-    def lut_estimation(self):
+    def lut_estimation(self, fpgapart):
         """return the number of LUTs required for this node"""
         res_dict = self.get_memory_estimate()
         return res_dict.get("LUTRAM", 0)
+
+    def bram_efficiency_estimation(self, fpgapart):
+        """return BRAM parameter storage efficiency for this node"""
+        _, used_bits, capacity_bits = self._get_memory_estimate_details()
+        if capacity_bits.get("BRAM", 0) == 0:
+            return 1
+        return used_bits["BRAM"] / capacity_bits["BRAM"]
+
+    def uram_efficiency_estimation(self, fpgapart):
+        """return URAM parameter storage efficiency for this node."""
+        # TODO: Versal URAM supports flexible bit widths (9/18/36/72) unlike
+        # UltraScale+ which only supports 72-bit. This could improve efficiency
+        # for narrow data types on Versal devices.
+        _, used_bits, capacity_bits = self._get_memory_estimate_details()
+        if capacity_bits.get("URAM", 0) == 0:
+            return 1
+        return used_bits["URAM"] / capacity_bits["URAM"]
 
     def get_all_meminit_filenames(self, abspath=False):
         "Return a list of all .dat memory initializer files used for this node"
@@ -282,7 +316,6 @@ class Thresholding_rtl(Thresholding, RTLBackend):
         # Set the 'gen_top_module' attribute for use later
         # by xsi and IPI generation
         self.set_nodeattr("gen_top_module", code_gen_dict["$TOP_MODULE$"][0])
-        axi_dir = os.path.join(os.environ["FINN_ROOT"], "finn-rtllib/axi/hdl/")
         rtlsrc = os.environ["FINN_ROOT"] + "/finn-rtllib/thresholding/hdl"
         template_path = rtlsrc + "/thresholding_template_wrapper.v"
         with open(template_path, "r") as f:
@@ -296,11 +329,6 @@ class Thresholding_rtl(Thresholding, RTLBackend):
             "w",
         ) as f:
             f.write(template_wrapper)
-
-        sv_files = ["thresholding.sv", "thresholding_axi.sv"]
-        for sv_file in sv_files:
-            shutil.copy(rtlsrc + "/" + sv_file, code_gen_dir)
-        shutil.copy(axi_dir + "axilite.sv", code_gen_dir)
 
         # set ipgen_path and ip_path so that HLS-Synth transformation
         # and stich_ip transformation do not complain
@@ -388,16 +416,9 @@ class Thresholding_rtl(Thresholding, RTLBackend):
     def code_generation_ipi(self):
         """Constructs and returns the TCL commands for node instantiation as an RTL
         block."""
-        rtl_file_list = self.get_rtl_file_list()
-        code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
-        source_target = "./ip/verilog/rtl_ops/%s" % self.onnx_node.name
-        cmd = ["file mkdir %s" % source_target]
-
-        for rtl_file in rtl_file_list:
-            cmd.append(
-                "add_files -copy_to %s -norecurse %s"
-                % (source_target, os.path.join(code_gen_dir, rtl_file))
-            )
+        cmd = []
+        for rtl_file in self.get_rtl_file_list(abspath=True):
+            cmd.append("add_files -norecurse %s" % rtl_file)
 
         # Create an RTL block, not an IP core (-type ip)
         cmd.append(
@@ -416,6 +437,16 @@ class Thresholding_rtl(Thresholding, RTLBackend):
 
     def generate_params(self, model, path):
         thresholds = model.get_initializer(self.onnx_node.input[1])
+
+        # RTL thresholding uses binary search, which requires sorted thresholds
+        # Check that thresholds are sorted in ascending order along the last axis
+        thresholds_sorted = np.all(np.diff(thresholds, axis=-1) >= 0)
+        assert thresholds_sorted, (
+            f"{self.onnx_node.name}: Thresholds must be sorted in ascending order "
+            "for RTL thresholding (uses binary search). "
+            "Sort thresholds along axis=-1 before inference."
+        )
+
         rt_weights = self.get_nodeattr("runtime_writeable_weights")
         file_name = "{}/memblock.dat".format(path)
         if rt_weights:
@@ -457,9 +488,13 @@ class Thresholding_rtl(Thresholding, RTLBackend):
             if thresholds.shape[0] == 1:
                 thresholds = np.broadcast_to(thresholds, (pe, expected_thresholds))
                 num_channels = pe
-            width_padded = roundup_to_integer_multiple(thresholds.shape[1], 2**o_bitwidth)
+            # Calculate width_padded to match RTL AXI address space allocation.
+            # RTL uses $clog2(N) bits for threshold addressing in the AXI interface,
+            # so the address space per channel is 2^clog2(n_thres_steps).
+            # For N=1, clog2(1)=0, so only 1 slot per channel.
+            width_padded = 1 << max(0, math.ceil(math.log2(n_thres_steps)))
             thresh_padded = np.zeros((thresholds.shape[0], width_padded))
-            thresh_padded[: thresholds.shape[0], :expected_thresholds] = thresholds
+            thresh_padded[: thresholds.shape[0], :n_thres_steps] = thresholds[:, :n_thres_steps]
             thresh_stream = []
             bw_hexdigit = roundup_to_integer_multiple(wdt.bitwidth(), 32)
             padding = np.zeros(width_padded, dtype=np.int32)
@@ -517,3 +552,56 @@ class Thresholding_rtl(Thresholding, RTLBackend):
                     with open(thresh_file, "w") as f:
                         for val in threshs:
                             f.write(val + "\n")
+
+    def minimize_weight_bit_width(self, model, datatype_only=False):
+        """Minimize threshold datatype, with RTL-specific adjustments.
+
+        The RTL implementation saturates inputs to the threshold datatype range
+        when the threshold datatype is narrower than the input datatype. To ensure
+        correct comparisons at saturation boundaries, the threshold datatype must
+        be able to represent [min_threshold - 1 : max_threshold].
+
+        Parameters
+        ----------
+        datatype_only : bool
+            If True, skip value-based minimization. See base class.
+        """
+        tdt = super().minimize_weight_bit_width(model, datatype_only=datatype_only)
+
+        # Check if we need RTL-specific adjustments
+        idt = self.get_input_datatype(0)
+        if not idt.is_integer() or not tdt.is_integer():
+            return tdt
+
+        # If threshold datatype is smaller than input datatype, we need to ensure
+        # it can represent min_threshold - 1 to handle RTL saturation correctly
+        if tdt.bitwidth() < idt.bitwidth():
+            thresholds = model.get_initializer(self.onnx_node.input[1])
+            min_threshold = np.float64(thresholds.min())
+            max_threshold = np.float64(thresholds.max())
+            min_required = min_threshold - 1
+            max_required = max_threshold
+
+            # Compute the new datatype that can represent the extended range
+            if min_required < 0:
+                if abs(min_required) > max_required:
+                    new_tdt = DataType.get_smallest_possible(min_required)
+                else:
+                    new_tdt = DataType.get_smallest_possible(-max_required - 1)
+            else:
+                if idt.signed():
+                    new_tdt = DataType.get_smallest_possible(-max_required - 1)
+                else:
+                    new_tdt = DataType.get_smallest_possible(max_required)
+
+            # Only update if the new datatype is wider
+            if new_tdt.bitwidth() > tdt.bitwidth():
+                threshold_tensor = self.get_hw_compatible_threshold_tensor(thresholds)
+                assert np.vectorize(new_tdt.allowed)(
+                    threshold_tensor
+                ).all(), "Thresholds can't be expressed with type %s" % str(new_tdt)
+                self.set_nodeattr("weightDataType", new_tdt.name)
+                model.set_tensor_datatype(self.onnx_node.input[1], new_tdt)
+                return new_tdt
+
+        return tdt

@@ -14,15 +14,18 @@ import copy
 import numpy as np
 import onnx
 import onnxscript
+import os
 from enum import Enum
 from onnxscript import ir
 from onnxscript.rewriter import pattern, rewrite
 from qonnx.core.modelwrapper import ModelWrapper
+from qonnx.custom_op.registry import getCustomOp, is_custom_op
 from qonnx.transformation.base import Transformation
 from qonnx.transformation.fold_constants import FoldConstants
 from typing import List, Tuple
 
 from finn.util import onnxscript_helpers as osh
+from finn.util.basic import make_build_dir
 
 
 def get_constant_from_value(value):
@@ -213,7 +216,7 @@ def build_loop_replace_pattern(graph, LoopBody):
 
 
 class LoopExtraction(Transformation):
-    def __init__(self, hierarchy_list: List[List[str]]):
+    def __init__(self, hierarchy_list: List[List[str]], loop_body_template_path=None):
         super().__init__()
 
         assert isinstance(hierarchy_list, list), "Hierarchy list must be a list of strings"
@@ -223,6 +226,10 @@ class LoopExtraction(Transformation):
                 isinstance(item, str) for item in hlist
             ), "All items in hierarchy sub-list must be strings"
         self.hierarchy_list = hierarchy_list
+        if loop_body_template_path is None:
+            template_dir = make_build_dir("loop_body_template_")
+            loop_body_template_path = os.path.join(template_dir, "loop-body-template.onnx")
+        self.loop_body_template_path = os.fspath(loop_body_template_path)
         self.loop_body_template = None
 
     def apply(self, model: ModelWrapper) -> Tuple[ModelWrapper, bool]:
@@ -253,12 +260,12 @@ class LoopExtraction(Transformation):
                 print("error: could not find metadata for node")
                 exit(1)
 
-            node.metadata_props["pkg.torch.onnx.name_scopes"] = mnode.metadata_props[
-                "pkg.torch.onnx.name_scopes"
-            ]
-            node.metadata_props["pkg.torch.onnx.class_hierarchy"] = mnode.metadata_props[
-                "pkg.torch.onnx.class_hierarchy"
-            ]
+            node.metadata_props["pkg.torch.onnx.name_scopes"] = mnode.metadata_props.get(
+                "pkg.torch.onnx.name_scopes", ""
+            )
+            node.metadata_props["pkg.torch.onnx.class_hierarchy"] = mnode.metadata_props.get(
+                "pkg.torch.onnx.class_hierarchy", ""
+            )
 
             assert P.add_node(node)
         graph.sort()
@@ -274,8 +281,8 @@ class LoopExtraction(Transformation):
         )
         proto = onnxscript.ir.serde.serialize_model(loop_body_model)
 
-        onnx.save(proto, "loop-body-template.onnx")
-        self.loop_body_template = LoopBodyTemplate("loop-body-template.onnx")
+        onnx.save(proto, self.loop_body_template_path)
+        self.loop_body_template = LoopBodyTemplate(self.loop_body_template_path)
 
         # Replace instances of the loop body with a function call to the loop body
         change_layers_to_function_calls = pattern.RewriteRule(
@@ -480,36 +487,40 @@ class LoopRolling(Transformation):
         # TODO: write a check to ensure that there is only one
         #       set of consecutive nodes.
         nodes = osh.find_nodes_of_optype(graph, LoopBody.function.name)
+        # MLO requires at least two repetitions of the loop body to roll into a
+        # FINNLoop. A single instance (iteration=1) cannot be handled by the
+        # downstream MLO machinery.
+        if len(nodes) < 2:
+            raise Exception(
+                f"LoopRolling: MLO requires at least 2 repetitions of the loop "
+                f"body, but found {len(nodes)}. A single-instance model cannot be "
+                f"rolled into a FINNLoop. Disable 'mlo' (or fix 'loop_body_hierarchy'/"
+                f"'loop_body_range') for this model."
+            )
         # Loop through all the nodes (execept the last one) and
         # identify the input to output pairs
 
         # my loop rolling code assumes that the activation inputs are listed first and
         # that corresponding output activations have the same index as the input
         input_swaps = []
-        if len(nodes) == 1:
-            # find and label the activation inputs
-            for i, input in enumerate(nodes[0].inputs):
-                if not input.is_initializer():
-                    if input.is_graph_input() or input.producer().op_type != "Constant":
-                        input_swaps.append((len(input_swaps), i))
-        else:
-            for i in range(len(nodes) - 1):
-                a_node = nodes[i]
-                b_node = nodes[i + 1]
+        # nodes is guaranteed to have >= 2 entries (checked above).
+        for i in range(len(nodes) - 1):
+            a_node = nodes[i]
+            b_node = nodes[i + 1]
 
-                for a_out in a_node.outputs:
-                    # Require that outputs of a have a single use of b_node
-                    assert len(a_out.uses()) == 1
-                    assert a_out.uses()[0][0] is b_node
+            for a_out in a_node.outputs:
+                # Require that outputs of a have a single use of b_node
+                assert len(a_out.uses()) == 1
+                assert a_out.uses()[0][0] is b_node
 
-                    a_use_index = a_out.uses()[0][1]
-                    input_swap = (a_out.index(), a_use_index)
-                    if i == 0:
-                        # add swaps from the first node
-                        input_swaps.append(input_swap)
-                    else:
-                        # check that they are the same in the rest
-                        assert input_swap in input_swaps
+                a_use_index = a_out.uses()[0][1]
+                input_swap = (a_out.index(), a_use_index)
+                if i == 0:
+                    # add swaps from the first node
+                    input_swaps.append(input_swap)
+                else:
+                    # check that they are the same in the rest
+                    assert input_swap in input_swaps
 
         # apply the input swaps to each nodes
         for node in nodes:
@@ -574,19 +585,20 @@ class LoopRolling(Transformation):
         # the determined input signature (e.g., changing parameter styles from
         # "const" to "input" for streamed parameters)
         # This must be done after serialization so we can work with protobuf nodes
-        import qonnx.custom_op.registry as registry
-        from qonnx.util.basic import get_by_name
 
         for loop_node in model_wrapper.get_nodes_by_op_type("FINNLoop"):
-            loop_body_graph = get_by_name(loop_node.attribute, "body").g
-            for node in loop_body_graph.node:
+            loop_body = getCustomOp(loop_node).get_nodeattr("body")
+            for node in loop_body.graph.node:
+                if not is_custom_op(node.domain):
+                    continue
                 try:
-                    inst = registry.getCustomOp(node)
+                    inst = getCustomOp(node)
                     inst.adapt_for_loop_body(LoopBody.signature)
                 except (KeyError, AttributeError):
                     # Operator doesn't need adaptation or doesn't support it
                     pass
+            getCustomOp(loop_node).set_nodeattr("body", loop_body.graph)
 
-        model = model_wrapper.transform(FoldConstants())
+        model = model_wrapper.transform(FoldConstants(), apply_to_subgraphs=True)
 
         return (model, False)

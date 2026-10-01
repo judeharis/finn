@@ -31,10 +31,10 @@ import os
 import warnings
 from abc import abstractmethod
 from qonnx.custom_op.base import CustomOp
-from qonnx.util.basic import roundup_to_integer_multiple
+from qonnx.util.basic import get_by_name, roundup_to_integer_multiple
 
 from finn import xsi
-from finn.util.basic import get_liveness_threshold_cycles, is_versal
+from finn.util.basic import get_watchdog_timeout_cycles, is_versal
 
 finnxsi = xsi if xsi.is_available() else None
 
@@ -85,15 +85,20 @@ class HWCustomOp(CustomOp):
             "inFIFODepths": ("ints", False, [2]),
             "outFIFODepths": ("ints", False, [2]),
             "output_hook": ("s", False, ""),
-            # accumulated characteristic function over two periods
-            "io_chrc_in": ("t", False, np.asarray([], dtype=np.int32)),
-            "io_chrc_out": ("t", False, np.asarray([], dtype=np.int32)),
+            # accumulated characteristic function over two periods; the arrays
+            # themselves are offloaded to sidecar .npy files (their shape is
+            # (n_streams, 2*period), which for large periods would blow the
+            # ONNX ModelProto past protobuf's 2GB limit). These attrs hold the
+            # paths to those files; see get_io_chrc_in()/get_io_chrc_out().
+            "io_chrc_in_file": ("s", False, ""),
+            "io_chrc_out_file": ("s", False, ""),
             # the period for which the characterization was run
             "io_chrc_period": ("i", False, 0),
             # amount of zero padding inserted during chrc.
             "io_chrc_pads_in": ("ints", False, []),
             "io_chrc_pads_out": ("ints", False, []),
             "mlo_max_iter": ("i", False, 0),
+            "address_offset": ("i", False, 0),
         }
 
     def make_shape_compatible_op(self, model):
@@ -162,35 +167,35 @@ class HWCustomOp(CustomOp):
         """Returns summarized resource estimation of BRAMs and LUTs
         of the node as a dictionary."""
         ret = dict()
-        ret["BRAM_18K"] = self.bram_estimation()
-        ret["BRAM_efficiency"] = self.bram_efficiency_estimation()
-        ret["LUT"] = self.lut_estimation()
-        ret["URAM"] = self.uram_estimation()
-        ret["URAM_efficiency"] = self.uram_efficiency_estimation()
+        ret["BRAM_18K"] = self.bram_estimation(fpgapart)
+        ret["BRAM_efficiency"] = self.bram_efficiency_estimation(fpgapart)
+        ret["LUT"] = self.lut_estimation(fpgapart)
+        ret["URAM"] = self.uram_estimation(fpgapart)
+        ret["URAM_efficiency"] = self.uram_efficiency_estimation(fpgapart)
         ret["DSP"] = self.dsp_estimation(fpgapart)
         return ret
 
-    def bram_efficiency_estimation(self):
+    def bram_efficiency_estimation(self, fpgapart):
         """Function for BRAM efficiency estimation: actual parameter storage
         needed divided by the allocated BRAM storage (from estimation)"""
         return 1
 
-    def uram_efficiency_estimation(self):
+    def uram_efficiency_estimation(self, fpgapart):
         """Function for URAM efficiency estimation: actual parameter storage
-        needed divided by the allocated URAM storage (from estimation)"""
+        needed divided by the allocated URAM storage (from estimation)."""
         return 1
 
-    def bram_estimation(self):
+    def bram_estimation(self, fpgapart):
         """Function for BRAM resource estimation, is member function of
         HWCustomOp class but has to be filled by every node"""
         return 0
 
-    def uram_estimation(self):
+    def uram_estimation(self, fpgapart):
         """Function for UltraRAM resource estimation, is member function of
         HWCustomOp class but has to be filled by every node"""
         return 0
 
-    def lut_estimation(self):
+    def lut_estimation(self, fpgapart):
         """Function for LUT resource estimation, is member function of
         HWCustomOp class but has to be filled by every node"""
         return 0
@@ -221,12 +226,16 @@ class HWCustomOp(CustomOp):
     def rtlsim_multi_io(self, sim, io_dict, sname="_V"):
         "Run rtlsim for this node, supports multiple i/o streams."
         num_out_values = self.get_number_output_values()
+        # LIVENESS_THRESHOLD can only increase the expected cycle count.
+        exp_cycles = self.get_exp_cycles()
+        effective_threshold = get_watchdog_timeout_cycles(exp_cycles)
         total_cycle_count = finnxsi.rtlsim_multi_io(
             sim,
             io_dict,
             num_out_values,
             sname=sname,
-            liveness_threshold=get_liveness_threshold_cycles(),
+            liveness_threshold=effective_threshold,
+            liveness_estimate=exp_cycles,
         )
 
         self.set_nodeattr("cycles_rtlsim", total_cycle_count)
@@ -237,10 +246,15 @@ class HWCustomOp(CustomOp):
         check if the number of inputs is equal to the expected number."""
         pass
 
-    def generate_params(self, model, path):
+    def generate_params(self, model, path, fpgapart=None):
         """Function to generate parameters (i.e. weights and thresholds),
         is member function of HWCustomOp class but has to be filled
-        by every node that needs to generate parameters."""
+        by every node that needs to generate parameters.
+
+        ``fpgapart`` is optional and only consumed by nodes whose parameter
+        layout depends on the target device (e.g. Requant, which resolves the
+        DSP version from it). Overrides that don't need it may keep the shorter
+        ``(model, path)`` signature."""
         pass
 
     def get_number_output_values(self):
@@ -296,35 +310,56 @@ class HWCustomOp(CustomOp):
         out_width = self.get_outstream_width(ind=ind)
         return roundup_to_integer_multiple(out_width, 8)
 
-    def generate_hdl_memstream(self, fpgapart, pumped_memory=0):
+    def generate_hdl_memstream(
+        self,
+        fpgapart,
+        pumped_memory=0,
+        name=None,
+        depth=None,
+        width=None,
+        init_file=None,
+        ram_style=None,
+    ):
         """Helper function to generate verilog code for memstream component.
-        Currently utilized by MVAU, VVAU and HLS Thresholding layer."""
-        ops = ["MVAU_hls", "MVAU_rtl", "VVAU_hls", "VVAU_rtl", "Thresholding_hls"]
+        Currently utilized by MVAU, VVAU, HLS Thresholding and RTL Requant layer.
+
+        By default a single memstream wrapper named after the node is emitted,
+        with depth/width/init_file/ram_style derived from the node. Callers that
+        need more than one memstreamer (e.g. RTL Requant streams scale and bias
+        separately) can pass explicit ``name``, ``depth``, ``width``,
+        ``init_file`` and ``ram_style`` to emit a named streamer without relying
+        on the op-specific defaults."""
+        ops = ["MVAU_hls", "MVAU_rtl", "VVAU_hls", "VVAU_rtl", "Thresholding_hls", "Requant_rtl"]
         if self.onnx_node.op_type in ops or self.onnx_node.op_type.startswith("Elementwise"):
             template_path = (
                 os.environ["FINN_ROOT"] + "/finn-rtllib/memstream/hdl/memstream_wrapper_template.v"
             )
-            mname = self.onnx_node.name
+            mname = name if name is not None else self.onnx_node.name
             sets = 1
             mlo_max_iter = self.get_nodeattr("mlo_max_iter")
             if mlo_max_iter:
                 sets = mlo_max_iter
-            if self.onnx_node.op_type.startswith("Thresholding"):
-                depth = self.calc_tmem()
-            else:
-                depth = self.calc_wmem()
-            padded_width = self.get_instream_width_padded(1)
             code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
-
-            ram_style = self.get_nodeattr("ram_style")
-            init_file = code_gen_dir + "/memblock.dat"
+            if depth is None:
+                if self.onnx_node.op_type.startswith("Thresholding"):
+                    depth = self.calc_tmem()
+                elif self.onnx_node.op_type.startswith("MVAU"):
+                    depth = self.calc_wmem() * self.get_nodeattr("TH")
+                else:
+                    depth = self.calc_wmem()
+            if width is None:
+                width = self.get_instream_width_padded(1)
+            if ram_style is None:
+                ram_style = self.get_nodeattr("ram_style")
+            if init_file is None:
+                init_file = code_gen_dir + "/memblock.dat"
             if ram_style == "ultra" and not is_versal(fpgapart):
                 init_file = ""
             code_gen_dict = {
                 "$MODULE_NAME$": [mname],
                 "$SETS$": [str(sets)],
                 "$DEPTH$": [str(depth)],
-                "$WIDTH$": [str(padded_width)],
+                "$WIDTH$": [str(width)],
                 "$INIT_FILE$": [init_file],
                 "$RAM_STYLE$": [ram_style],
                 "$PUMPED_MEMORY$": [str(pumped_memory)],
@@ -332,9 +367,9 @@ class HWCustomOp(CustomOp):
             # apply code generation to template
             with open(template_path, "r") as f:
                 template_wrapper = f.read()
-            for key in code_gen_dict:
+            for key, value in code_gen_dict.items():
                 # transform list into long string separated by '\n'
-                code_gen_line = "\n".join(code_gen_dict[key])
+                code_gen_line = "\n".join(value)
                 template_wrapper = template_wrapper.replace(key, code_gen_line)
             with open(
                 os.path.join(code_gen_dir, mname + "_memstream_wrapper.v"),
@@ -344,12 +379,14 @@ class HWCustomOp(CustomOp):
         else:
             pass
 
-    def generate_hdl_fetch_weights(self, fpgapart):
+    def generate_hdl_fetch_weights(self):
         """Helper function to generate verilog code for fetch_weights component.
         Currently utilized by MVAU."""
         ops = ["MVAU_hls", "MVAU_rtl"]
         if self.onnx_node.op_type in ops or self.onnx_node.op_type.startswith("Elementwise"):
-            template_path = os.environ["FINN_ROOT"] + "/finn-rtllib/mlo/fetch_weights_wrapper.v"
+            template_path = (
+                os.environ["FINN_ROOT"] + "/finn-rtllib/fetch_weights/fetch_weights_wrapper.v"
+            )
             mname = self.onnx_node.name
             wdt = self.get_input_datatype(1)
             if self.onnx_node.op_type in ops:
@@ -357,7 +394,9 @@ class HWCustomOp(CustomOp):
                 mh = self.get_nodeattr("MH")
                 pe = self.get_nodeattr("PE")
                 simd = self.get_nodeattr("SIMD")
-                n_reps = np.prod(self.get_nodeattr("numInputVectors"))
+                theight = self.get_nodeattr("TH")
+                n_reps = np.prod(self.get_nodeattr("numInputVectors")) // theight
+                en_mlo = "EN_MLO" if self.get_nodeattr("mlo_max_iter") else "NO_MLO"
             else:
                 # Eltwise layers only have one parallelism parameter
                 mw = 1
@@ -366,10 +405,12 @@ class HWCustomOp(CustomOp):
                 simd = 1
                 # TODO use broadcast rhs shape here
                 n_reps = np.prod(self.get_nodeattr("rhs_shape")[:-1])
-            layer_offs = mw * mh
+                theight = 1
+                en_mlo = "EN_MLO" if self.get_nodeattr("mlo_max_iter") else "NO_MLO"
             # upper bound on how many layers can be supported, set to 64 for now
             n_max_layers = 64
             code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
+
             code_gen_dict = {
                 "$MODULE_NAME_AXI_WRAPPER$": [mname + "_fetch_weights_wrapper"],
                 "$MW$": [str(mw)],
@@ -378,16 +419,22 @@ class HWCustomOp(CustomOp):
                 "$SIMD$": [str(simd)],
                 "$N_REPS$": [str(n_reps)],
                 "$WEIGHT_WIDTH$": [str(wdt.bitwidth())],
-                "$LAYER_OFFS$": [str(layer_offs)],
                 "$N_LAYERS$": [str(n_max_layers)],
+                "$TH$": [str(theight)],
+                "$EN_MLO$": [en_mlo],
+                "$ADDRESS_OFFSET$": [str(self.get_nodeattr("address_offset"))],
             }
             # apply code generation to template
             with open(template_path, "r") as f:
                 template_wrapper = f.read()
-            for key in code_gen_dict:
+            for key, value in code_gen_dict.items():
                 # transform list into long string separated by '\n'
-                code_gen_line = "\n".join(code_gen_dict[key])
+                code_gen_line = "\n".join(value)
                 template_wrapper = template_wrapper.replace(key, code_gen_line)
+            # DDR exposes a runtime base_address port; HBM leaves the macro undefined
+            # so the port is dropped and the streamer reads from address 0.
+            if get_by_name(self.onnx_node.attribute, "address_offset") is not None:
+                template_wrapper = "`define HAS_BASE_ADDRESS\n" + template_wrapper
             with open(
                 os.path.join(code_gen_dir, mname + "_fetch_weights_wrapper.v"),
                 "w",
@@ -419,9 +466,9 @@ class HWCustomOp(CustomOp):
         # apply code generation to template
         with open(template_path, "r") as f:
             template_wrapper = f.read()
-        for key in code_gen_dict:
+        for key, value in code_gen_dict.items():
             # transform list into long string separated by '\n'
-            code_gen_line = "\n".join(code_gen_dict[key])
+            code_gen_line = "\n".join(value)
             template_wrapper = template_wrapper.replace(key, code_gen_line)
         with open(
             os.path.join(code_gen_dir, mname + "_dynamic_load_wrapper.v"),
@@ -474,8 +521,20 @@ class HWCustomOp(CustomOp):
             txns_in[k] = sim.trace_stream(k + sname)
         for k in txns_out.keys():
             txns_out[k] = sim.trace_stream(k + sname)
-        self.rtlsim_multi_io(sim, io_dict)
-        total_cycle_count = self.get_nodeattr("cycles_rtlsim")
+        # For characterization, use period as liveness threshold directly
+        try:
+            total_cycle_count = finnxsi.rtlsim_multi_io(
+                sim,
+                io_dict,
+                num_out_values=self.get_number_output_values(),
+                sname=sname,
+                liveness_threshold=period,
+            )
+        finally:
+            # Assert sim_finish to trigger $finish so that SystemVerilog final
+            # blocks execute, which flush and close the fifo_gauge log files.
+            self.close_rtlsim(sim)
+        self.set_nodeattr("cycles_rtlsim", total_cycle_count)
         assert (
             total_cycle_count <= period
         ), """Total cycle count from rtl simulation is higher than
@@ -485,10 +544,10 @@ class HWCustomOp(CustomOp):
         self.set_nodeattr("io_chrc_period", period)
         # call str() on stream tracers to get their outputs, and convert
         # to list of ints
-        for k in txns_in.keys():
-            txns_in[k] = [int(c) for c in str(txns_in[k])]
-        for k in txns_out.keys():
-            txns_out[k] = [int(c) for c in str(txns_out[k])]
+        for k, v in txns_in.items():
+            txns_in[k] = [int(c) for c in str(v)]
+        for k, v in txns_out.items():
+            txns_out[k] = [int(c) for c in str(v)]
 
         def accumulate_char_fxn(chrc):
             p = len(chrc)
@@ -524,10 +583,43 @@ class HWCustomOp(CustomOp):
             all_txns_out[out_idx, :] = txn_out
             all_pad_out.append(pad_out)
 
-        self.set_nodeattr("io_chrc_in", all_txns_in)
-        self.set_nodeattr("io_chrc_out", all_txns_out)
+        # Offload the (potentially very large) characteristic arrays to sidecar
+        # .npy files rather than storing them as ONNX tensor attributes, which
+        # would otherwise push the ModelProto past protobuf's 2GB message limit
+        # (the arrays are shape (n_streams, 2*period)).
+        code_gen_dir = self.get_nodeattr("code_gen_dir_ipgen")
+        assert code_gen_dir != "", (
+            "code_gen_dir_ipgen not set for %s; cannot store io_chrc sidecar files"
+            % self.onnx_node.name
+        )
+        in_file = os.path.join(code_gen_dir, "io_chrc_in.npy")
+        out_file = os.path.join(code_gen_dir, "io_chrc_out.npy")
+        np.save(in_file, all_txns_in)
+        np.save(out_file, all_txns_out)
+        self.set_nodeattr("io_chrc_in_file", in_file)
+        self.set_nodeattr("io_chrc_out_file", out_file)
         self.set_nodeattr("io_chrc_pads_in", all_pad_in)
         self.set_nodeattr("io_chrc_pads_out", all_pad_out)
+
+    def get_io_chrc_in(self):
+        """Load the input characteristic array from its sidecar .npy file.
+
+        Returns an array of shape (n_streams, 2*period), or an empty (0, 0)
+        int32 array if characterization has not been run for this node."""
+        fname = self.get_nodeattr("io_chrc_in_file")
+        if fname == "" or not os.path.isfile(fname):
+            return np.empty((0, 0), dtype=np.int32)
+        return np.load(fname)
+
+    def get_io_chrc_out(self):
+        """Load the output characteristic array from its sidecar .npy file.
+
+        Returns an array of shape (n_streams, 2*period), or an empty (0, 0)
+        int32 array if characterization has not been run for this node."""
+        fname = self.get_nodeattr("io_chrc_out_file")
+        if fname == "" or not os.path.isfile(fname):
+            return np.empty((0, 0), dtype=np.int32)
+        return np.load(fname)
 
     def adapt_for_loop_body(self, input_types):
         """

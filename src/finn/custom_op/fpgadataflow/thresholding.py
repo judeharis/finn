@@ -124,11 +124,19 @@ class Thresholding(HWCustomOp):
         """Returns FINN DataType of output."""
         return DataType[self.get_nodeattr("outputDataType")]
 
-    def minimize_accumulator_width(self, model):
-        """Minimize threshold width ('accumulator width' here due to convention).
+    def minimize_weight_bit_width(self, model, datatype_only=False):
+        """Minimize threshold datatype bitwidth based on actual threshold values.
         This function should not round or clip the threshold values,
-        that is done in RoundAndClipThresholds. It should just align the threshold dtype
-        with the input dtype if necessary."""
+        that is done in RoundAndClipThresholds.
+
+        Parameters
+        ----------
+        datatype_only : bool
+            If True, skip value-based minimization.
+        """
+        if datatype_only:
+            return DataType[self.get_nodeattr("weightDataType")]
+
         thresholds = model.get_initializer(self.onnx_node.input[1])
         if self.get_nodeattr("runtime_writeable_weights") or self.get_nodeattr("mlo_max_iter"):
             return DataType[self.get_nodeattr("weightDataType")]
@@ -139,20 +147,26 @@ class Thresholding(HWCustomOp):
             # Use double precision for intermediate calculations to prevent overflow
             min_threshold = np.float64(thresholds.min())
             max_threshold = np.float64(thresholds.max())
-            min_input = np.float64(self.get_input_datatype(0).min())
-            max_input = np.float64(self.get_input_datatype(0).max())
-
-            # get range required by threshold values
-            tdt_min = min(min_input, min_threshold)
-            tdt_max = max(max_input, max_threshold)
-
-            if tdt_min < 0:
-                if abs(tdt_min) > tdt_max:
-                    tdt = DataType.get_smallest_possible(tdt_min)
+            # Check if input datatype is signed
+            input_is_signed = self.get_input_datatype(0).signed()
+            # Special case: all thresholds are zero
+            # get_smallest_possible(-1) returns BIPOLAR which can't represent 0
+            if min_threshold == max_threshold == 0:
+                if input_is_signed:
+                    tdt = DataType["INT2"]
                 else:
-                    tdt = DataType.get_smallest_possible(-tdt_max - 1)
+                    tdt = DataType["UINT1"]
+            elif min_threshold < 0:
+                if abs(min_threshold) > max_threshold:
+                    tdt = DataType.get_smallest_possible(min_threshold)
+                else:
+                    tdt = DataType.get_smallest_possible(-max_threshold - 1)
             else:
-                tdt = DataType.get_smallest_possible(tdt_max)
+                # If input is signed, use signed threshold datatype even if thresholds are positive
+                if input_is_signed:
+                    tdt = DataType.get_smallest_possible(-max_threshold - 1)
+                else:
+                    tdt = DataType.get_smallest_possible(max_threshold)
         else:
             # special case: if input is float, we keep thresholds as is
             tdt = self.get_input_datatype(1)
@@ -261,16 +275,11 @@ class Thresholding(HWCustomOp):
         inp_values = context[node.input[0]]
         th_val = context[node.input[1]]
         out_bias = self.get_nodeattr("ActVal")
-        # MT expects inputs to be in the shape (N,C,H,W) or (N, C)
-        # if 4D then input values in context are (N,H,W,C) and need to
-        # be transposed.
-        # if 2D then inputs can be passed directly to MT function
-        is_4d = len(inp_values.shape) == 4
-        if is_4d:
-            inp_values = np.transpose(inp_values, (0, 3, 1, 2))
-        y = multithreshold(inp_values, th_val, out_bias=out_bias)
-        if is_4d:
-            y = y.transpose(0, 2, 3, 1)
+
+        # HW activations are always channels-last, so threshold the last axis
+        # regardless of rank.
+        y = multithreshold(inp_values, th_val, out_bias=out_bias, channels_last=True)
+
         act = DataType[self.get_nodeattr("outputDataType")]
         if act == DataType["BIPOLAR"]:
             # binary to bipolar
