@@ -160,7 +160,7 @@ class Deconvolution(HWCustomOp):
         out_width = o_bits * self.get_nodeattr("PE")
         return out_width
 
-    # Jude: Edited
+    # Jude: Edited, Removed
     def get_exp_cycles(self) -> int:
         # Regression coefficients for overhead = c0 + c1*H_EFF + c2*SF + c3*K
         # + c4*K*H_EFF + c5*K*SF, fit against 32 real cosim runs. See
@@ -291,9 +291,7 @@ class Deconvolution(HWCustomOp):
             )
 
         return total_cycles
-    # Jude: Done
 
-    # Jude: Edited
     # Resource model for finn-hlslib deconv(), checked against Vivado post-synthesis of the
     # ESPCN deconv (K=6 S=2 P=2 128x128, CI=32 CO=3, UINT4 x INT8) at PE1/SIMD1 and
     # PE3/SIMD4: BRAM and DSP match both exactly; the LUT constants are fitted to those two
@@ -310,7 +308,7 @@ class Deconvolution(HWCustomOp):
         width = self.get_nodeattr("SIMD") * self.get_input_datatype().bitwidth()
         return depth, width
 
-    def bram_estimation(self):
+    def bram_estimation(self, fpgapart):
         # The line buffer is the only BRAM user; the weights are a ROM in LUTs.
         # BRAM18 aspect ratios: 16Kx1, 8Kx2, 4Kx4, 2Kx9, 1Kx18, 512x36.
         depth, width = self._swg_buffer_shape()
@@ -320,7 +318,7 @@ class Deconvolution(HWCustomOp):
         per = next((b for d, b in sorted(bits_per_bram.items()) if depth <= d), 36)
         return int(np.ceil(width / per))
 
-    def lut_estimation(self):
+    def lut_estimation(self, fpgapart):
         # control + weight ROM (64 bits per LUT6) + per-multiplier datapath
         weight_bits = (
             np.prod(self.get_nodeattr("KernelDim"))
@@ -334,13 +332,11 @@ class Deconvolution(HWCustomOp):
     def dsp_estimation(self, fpgapart):
         # HLS maps every weight x activation product to its own DSP
         return self.get_nodeattr("PE") * self.get_nodeattr("SIMD")
-    # Jude: Done
 
-    def uram_estimation(self):
+    def uram_estimation(self, fpgapart):
         return 0
 
     def execute_node(self, context, graph):
-        # Jude: Edited, Removed
         # Python reference: scatter each input pixel's K x K x OFM contribution onto
         # the stride-S output grid, then crop Padding off every edge. NHWC input,
         # weights [OFM][K][K][IFM]. Accumulates in float64, which is exact for any
