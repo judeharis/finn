@@ -164,6 +164,13 @@ ARG USERNAME
 ARG USER_UID
 ARG GROUP_ID
 ARG GROUPNAME
+# Jude: Edited
+# Ubuntu 24.04 base images ship a default "ubuntu" user (UID/GID 1000), so useradd fails
+# with exit 4 (UID in use) for the common host UID 1000. Remove whichever user holds the
+# UID; userdel also drops its group, so the new user's group gets GID 1000 as on the host.
+RUN existing=$(getent passwd "$USER_UID" | cut -d: -f1); \
+    if [ -n "$existing" ] && [ "$existing" != "$USERNAME" ]; then userdel "$existing"; fi
+# Jude: Done
 RUN useradd $USERNAME -u $USER_UID
 # Check and add group if it doesn't exist
 RUN if ! getent group "$GROUP_ID" > /dev/null 2>&1 && ! getent group "$GROUPNAME" > /dev/null 2>&1; then \
