@@ -165,6 +165,12 @@ ARG USER_UID
 ARG GROUP_ID
 ARG GROUPNAME
 # Jude: Edited
+# Vivado / Vitis HLS 2024.1 need libtinfo.so.5 (vitis_hls dies at start-up with "couldn't load
+# file libxv_commontasks.so: libtinfo.so.5"); Ubuntu 24.04 dropped libtinfo5, so install
+# Ubuntu 22.04's package, the same library the tools run against on a 22.04 host.
+RUN wget -q http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libtinfo5_6.3-2ubuntu0.3_amd64.deb -O /tmp/libtinfo5.deb && \
+    echo "4df4288404108f1a156d014e8764a064e977e34e6d44931ab60451694c03c90d  /tmp/libtinfo5.deb" | sha256sum -c - && \
+    dpkg -i /tmp/libtinfo5.deb && rm /tmp/libtinfo5.deb
 # Ubuntu 24.04 base images ship a default "ubuntu" user (UID/GID 1000), so useradd fails
 # with exit 4 (UID in use) for the common host UID 1000. Remove whichever user holds the
 # UID; userdel also drops its group, so the new user's group gets GID 1000 as on the host.
