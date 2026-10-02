@@ -58,6 +58,9 @@ from finn.custom_op.fpgadataflow.convolutioninputgenerator import (
 )
 from finn.custom_op.fpgadataflow.crop import Crop
 from finn.custom_op.fpgadataflow.deconvolution import Deconvolution
+# Jude: Edited MM2IMv2
+from finn.custom_op.fpgadataflow.deconvolution_mm2im import DeconvolutionMM2IM
+# Jude: Done MM2IMv2
 from finn.custom_op.fpgadataflow.duplicatestreams import DuplicateStreams
 from finn.custom_op.fpgadataflow.fmpadding import FMPadding
 from finn.custom_op.fpgadataflow.fmpadding_pixel import FMPadding_Pixel
@@ -98,6 +101,9 @@ custom_op["StreamingDataflowPartition"] = StreamingDataflowPartition
 
 custom_op["ConvolutionInputGenerator"] = ConvolutionInputGenerator
 custom_op["Deconvolution"] = Deconvolution
+# Jude: Edited MM2IMv2
+custom_op["DeconvolutionMM2IM"] = DeconvolutionMM2IM
+# Jude: Done MM2IMv2
 custom_op["Crop"] = Crop
 custom_op["DuplicateStreams"] = DuplicateStreams
 custom_op["FMPadding"] = FMPadding

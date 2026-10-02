@@ -57,6 +57,9 @@ from finn.custom_op.fpgadataflow.hls.checksum_hls import CheckSum_hls
 from finn.custom_op.fpgadataflow.hls.concat_hls import StreamingConcat_hls
 from finn.custom_op.fpgadataflow.hls.crop_hls import Crop_hls
 from finn.custom_op.fpgadataflow.hls.deconvolution_hls import Deconvolution_hls
+# Jude: Edited MM2IMv2
+from finn.custom_op.fpgadataflow.hls.deconvolution_mm2im_hls import DeconvolutionMM2IM_hls
+# Jude: Done MM2IMv2
 from finn.custom_op.fpgadataflow.hls.duplicatestreams_hls import DuplicateStreams_hls
 from finn.custom_op.fpgadataflow.hls.fmpadding_pixel_hls import FMPadding_Pixel_hls
 from finn.custom_op.fpgadataflow.hls.globalaccpool_hls import GlobalAccPool_hls
@@ -82,6 +85,9 @@ from finn.custom_op.fpgadataflow.hls.vectorvectoractivation_hls import VVAU_hls
 # registered and plug in correctly into the infrastructure
 custom_op["CheckSum_hls"] = CheckSum_hls
 custom_op["Deconvolution_hls"] = Deconvolution_hls
+# Jude: Edited MM2IMv2
+custom_op["DeconvolutionMM2IM_hls"] = DeconvolutionMM2IM_hls
+# Jude: Done MM2IMv2
 custom_op["Crop_hls"] = Crop_hls
 custom_op["DuplicateStreams_hls"] = DuplicateStreams_hls
 custom_op["FMPadding_Pixel_hls"] = FMPadding_Pixel_hls

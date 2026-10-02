@@ -330,6 +330,9 @@ class HWCustomOp(CustomOp):
         ``init_file`` and ``ram_style`` to emit a named streamer without relying
         on the op-specific defaults."""
         ops = ["MVAU_hls", "MVAU_rtl", "VVAU_hls", "VVAU_rtl", "Thresholding_hls", "Requant_rtl"]
+        # Jude: Edited MM2IMv2
+        ops.append("DeconvolutionMM2IM_hls")
+        # Jude: Done MM2IMv2
         if self.onnx_node.op_type in ops or self.onnx_node.op_type.startswith("Elementwise"):
             template_path = (
                 os.environ["FINN_ROOT"] + "/finn-rtllib/memstream/hdl/memstream_wrapper_template.v"

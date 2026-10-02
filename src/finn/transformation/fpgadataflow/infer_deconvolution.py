@@ -17,7 +17,7 @@ class InferDeconvolution(Transformation):
 
     Only ConvTranspose nodes the finn-hlslib deconv kernel can implement are
     converted: group 1, dilation 1, no bias, square kernel/stride/padding, K
-    divisible by S, integer input and weights, and an output that fits the INT32
+    divisible by S (rev2d only), P < K (mm2im only), integer input and weights, and an output that fits the INT32
     accumulator. Anything else is left in place (with a warning) for
     InferPixelPaddingDeconv. PE and SIMD start at 1 and are set by folding.
 
@@ -25,7 +25,24 @@ class InferDeconvolution(Transformation):
     MultiThreshold is not absorbed and becomes a standalone Thresholding layer.
     The Transpose nodes need to be streamlined away afterwards, e.g. with
     AbsorbConsecutiveTransposes and AbsorbTransposeIntoMultiThreshold.
+
+    impl selects the HW layer:
+
+    * "rev2d" (default): Deconvolution, finn-hlslib deconv.hpp (gather; needs S | K).
+    * "mm2im": DeconvolutionMM2IM, finn-hlslib mm2im.hpp (input-stationary scatter).
+      Also takes K % S != 0 and K < S (any P < K). accDataType starts at INT32;
+      MinimizeAccumulatorWidth narrows it (and the output) from the weight values.
+      mem_mode (mm2im only) is internal_embedded (weight ROM, SKIP on),
+      internal_decoupled (memstream) or external (weights streamed in); the streamed
+      modes visit every tap (SKIP off).
     """
+
+    def __init__(self, impl="rev2d", mem_mode="internal_embedded"):
+        super().__init__()
+        assert impl in ("rev2d", "mm2im"), "impl must be rev2d or mm2im, got %s" % impl
+        assert impl == "mm2im" or mem_mode == "internal_embedded", "rev2d embeds its weights"
+        self.impl = impl
+        self.mem_mode = mem_mode
 
     def apply(self, model):
         graph = model.graph
@@ -62,8 +79,15 @@ class InferDeconvolution(Transformation):
             inp_trans_node = helper.make_node(
                 "Transpose", [deconv_input], [inp_trans_out], perm=[0, 2, 3, 1]
             )
+            if self.impl == "mm2im":
+                # one call per frame: the default (ifm_aware) cppsim template
+                skip = int(self.mem_mode == "internal_embedded")
+                op_type = "DeconvolutionMM2IM"
+                impl_attrs = dict(accDataType=odt.name, SKIP=skip, mem_mode=self.mem_mode)
+            else:
+                op_type, impl_attrs = "Deconvolution", dict(hls_style="freerunning")
             deconv_node = helper.make_node(
-                "Deconvolution",
+                op_type,
                 [inp_trans_out, w_name],
                 [deconv_out],
                 domain="finn.custom_op.fpgadataflow",
@@ -79,9 +103,9 @@ class InferDeconvolution(Transformation):
                 inputDataType=idt.name,
                 weightDataType=wdt.name,
                 outputDataType=odt.name,
-                name="Deconvolution_" + n.name,
+                name=op_type + "_" + n.name,
                 cpp_interface="hls_vector",
-                hls_style="freerunning",
+                **impl_attrs,
             )
             # NHWC -> NCHW
             out_trans_node = helper.make_node(
@@ -136,8 +160,10 @@ class InferDeconvolution(Transformation):
         if len(set(kernel)) != 1 or len(set(stride)) != 1 or len(set(pads)) != 1:
             return skip("only square kernel, stride and symmetric padding are supported")
         k, s, p = kernel[0], stride[0], pads[0]
-        if k % s != 0:
+        if self.impl == "rev2d" and k % s != 0:
             return skip("kernel size %d is not divisible by stride %d" % (k, s))
+        if self.impl == "mm2im" and p >= k:
+            return skip("padding %d is not smaller than the kernel size %d" % (p, k))
 
         ifm_ch, ifm_dim = ishape[1], (ishape[2], ishape[3])
         ofm_ch = W.shape[1]

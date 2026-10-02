@@ -153,6 +153,11 @@ class SetFolding(Transformation):
                 continue
             op_type = node.op_type
             node_inst = getCustomOp(node)
+            # Jude: Edited MM2IMv2
+            # DeconvolutionMM2IM_hls folds like Deconvolution_hls (SIMD first, then PE)
+            if op_type == "DeconvolutionMM2IM_hls":
+                op_type = "Deconvolution_hls"
+            # Jude: Done MM2IMv2
             if op_type in ["MVAU_hls", "MVAU_rtl"]:
                 max_simd = node_inst.get_nodeattr("MW")
                 max_pe = node_inst.get_nodeattr("MH")
