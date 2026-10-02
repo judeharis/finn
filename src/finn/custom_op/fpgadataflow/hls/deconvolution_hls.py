@@ -182,6 +182,7 @@ class Deconvolution_hls(Deconvolution, HLSBackend):
         self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS INTERFACE axis port=out0_V")
         self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS INTERFACE ap_ctrl_none port=return")
         # Jude: Edited
+        # Required: deconv() is ap_ctrl_none, so HLS rejects it in a sequential caller (HLS 200-649)
         self.code_gen_dict["$PRAGMAS$"].append("#pragma HLS dataflow disable_start_propagation")
         # Without compact=bit, HLS gives every sub-byte hls::vector element its own
         # byte, so UINT4 x SIMD=4 synthesizes a 32-bit port while get_instream_width()
