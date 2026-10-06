@@ -39,7 +39,7 @@ BREVITAS_COMMIT="aad4d5a293db6f2ec622a92a5d3278e47072453e"
 # judeharis/finn-hlslib jude/deconv-dev = hlslib dev 8d979e2 + Xilinx feature/deconv 120c462,
 # the only place deconv.hpp (used by Deconvolution_hls) exists, + mm2im.hpp (MM2IMv2,
 # DeconvolutionMM2IM_hls)
-HLSLIB_COMMIT="519387a28911b608529f167c19a4034ae4c69722"
+HLSLIB_COMMIT="295a6bb1a377716acf6eb62c062eb57ec65de63f"
 # Jude: Done
 AVNET_BDF_COMMIT="2d49cfc25766f07792c0b314489f21fe916b639b"
 XIL_BDF_COMMIT="8cf4bb674a919ac34e3d99d8d71a9e60af93d14e"
